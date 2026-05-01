@@ -1050,6 +1050,21 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
     let agent_cfg = crate::agent_runner::AgentRunnerConfig {
         command: ctx.config.codex_command.clone(),
         workspace_path: ctx.workspace_path.clone(),
+        approval_policy: ctx
+            .config
+            .codex_approval_policy
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_CODEX_APPROVAL_POLICY.into()),
+        thread_sandbox: ctx
+            .config
+            .codex_thread_sandbox
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_CODEX_THREAD_SANDBOX.into()),
+        turn_sandbox_policy: ctx
+            .config
+            .codex_turn_sandbox_policy
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_CODEX_TURN_SANDBOX_POLICY.into()),
         turn_timeout_ms: ctx.config.codex_turn_timeout_ms,
         read_timeout_ms: ctx.config.codex_read_timeout_ms,
         stall_timeout_ms: ctx.config.codex_stall_timeout_ms,

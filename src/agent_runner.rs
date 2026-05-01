@@ -9,6 +9,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
+use crate::config::{
+    DEFAULT_CODEX_APPROVAL_POLICY, DEFAULT_CODEX_THREAD_SANDBOX, DEFAULT_CODEX_TURN_SANDBOX_POLICY,
+};
 use crate::types::{CancelHandle, Issue, LiveSession, RunningEntry, make_session_id};
 
 /// Outcome of an agent run attempt.
@@ -30,6 +33,9 @@ pub enum AgentOutcome {
 pub struct AgentRunnerConfig {
     pub command: String,
     pub workspace_path: PathBuf,
+    pub approval_policy: String,
+    pub thread_sandbox: String,
+    pub turn_sandbox_policy: String,
     #[allow(dead_code)]
     pub turn_timeout_ms: u64,
     #[allow(dead_code)]
@@ -116,15 +122,7 @@ pub async fn run_agent_attempt(
     let thread_id = format!("thread-{}", &session_id[..8]);
 
     // ── Send initial session setup ──
-    let setup_msg = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "v2/ThreadStart",
-        "params": {
-            "threadId": thread_id,
-            "prompt": prompt,
-        },
-        "id": 1
-    });
+    let setup_msg = thread_start_request(&thread_id, &prompt, &config);
 
     // Take stdin once and keep it alive for the full turn loop
     let mut child_stdin = match child.stdin.take() {
@@ -233,16 +231,8 @@ pub async fn run_agent_attempt(
                 turn_number += 1;
                 let continuation = continuation_template(turn_number, max_turns);
 
-                let cont_msg = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "v2/TurnStart",
-                    "params": {
-                        "threadId": thread_id,
-                        "turnId": turn_id,
-                        "prompt": continuation,
-                    },
-                    "id": turn_number
-                });
+                let cont_msg =
+                    turn_start_request(&thread_id, &turn_id, &continuation, turn_number, &config);
 
                 {
                     use tokio::io::AsyncWriteExt;
@@ -291,6 +281,78 @@ pub async fn run_agent_attempt(
     AgentOutcome::Normal {
         entry,
         total_turns: turn_number,
+    }
+}
+
+fn thread_start_request(
+    thread_id: &str,
+    prompt: &str,
+    config: &AgentRunnerConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "v2/ThreadStart",
+        "params": {
+            "threadId": thread_id,
+            "prompt": prompt,
+            "cwd": config.workspace_path.to_string_lossy(),
+            "approvalPolicy": approval_policy_wire(&config.approval_policy),
+            "sandbox": thread_sandbox_wire(&config.thread_sandbox),
+        },
+        "id": 1
+    })
+}
+
+fn turn_start_request(
+    thread_id: &str,
+    turn_id: &str,
+    prompt: &str,
+    id: u32,
+    config: &AgentRunnerConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "v2/TurnStart",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "prompt": prompt,
+            "cwd": config.workspace_path.to_string_lossy(),
+            "approvalPolicy": approval_policy_wire(&config.approval_policy),
+            "sandboxPolicy": turn_sandbox_policy_payload(&config.turn_sandbox_policy),
+        },
+        "id": id
+    })
+}
+
+fn approval_policy_wire(policy: &str) -> &'static str {
+    match policy {
+        "on-request" => "onRequest",
+        "on-failure" => "onFailure",
+        "unless-trusted" => "unlessTrusted",
+        "never" => "never",
+        _ => approval_policy_wire(DEFAULT_CODEX_APPROVAL_POLICY),
+    }
+}
+
+fn thread_sandbox_wire(sandbox: &str) -> &'static str {
+    match sandbox {
+        "read-only" => "readOnly",
+        "workspace-write" => "workspaceWrite",
+        "danger-full-access" => "dangerFullAccess",
+        _ => thread_sandbox_wire(DEFAULT_CODEX_THREAD_SANDBOX),
+    }
+}
+
+fn turn_sandbox_policy_payload(sandbox: &str) -> serde_json::Value {
+    match sandbox {
+        "read-only" => serde_json::json!({ "type": "readOnly" }),
+        "danger-full-access" => serde_json::json!({ "type": "dangerFullAccess" }),
+        "workspace-write" => serde_json::json!({
+            "type": "workspaceWrite",
+            "networkAccess": true,
+        }),
+        _ => turn_sandbox_policy_payload(DEFAULT_CODEX_TURN_SANDBOX_POLICY),
     }
 }
 
@@ -454,4 +516,68 @@ pub async fn run_mock_agent(workspace: &Path, issue_id: &str) -> Result<(), Stri
     std::fs::write(&control_path, content).map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    fn test_config() -> AgentRunnerConfig {
+        AgentRunnerConfig {
+            command: "codex app-server".into(),
+            workspace_path: PathBuf::from("/tmp/symphony-workspace"),
+            approval_policy: "on-request".into(),
+            thread_sandbox: "danger-full-access".into(),
+            turn_sandbox_policy: "read-only".into(),
+            turn_timeout_ms: 1,
+            read_timeout_ms: 1,
+            stall_timeout_ms: 1,
+            max_turns: 1,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn thread_start_request_includes_configured_runtime_policy() {
+        let msg = thread_start_request("thread-1", "prompt", &test_config());
+
+        assert_eq!(msg.pointer("/params/approvalPolicy").unwrap(), "onRequest");
+        assert_eq!(msg.pointer("/params/sandbox").unwrap(), "dangerFullAccess");
+        assert_eq!(
+            msg.pointer("/params/cwd").unwrap(),
+            "/tmp/symphony-workspace"
+        );
+    }
+
+    #[test]
+    fn turn_start_request_includes_configured_runtime_policy() {
+        let msg = turn_start_request("thread-1", "turn-1", "prompt", 2, &test_config());
+
+        assert_eq!(msg.pointer("/params/approvalPolicy").unwrap(), "onRequest");
+        assert_eq!(
+            msg.pointer("/params/sandboxPolicy").unwrap(),
+            &serde_json::json!({ "type": "readOnly" })
+        );
+        assert_eq!(
+            msg.pointer("/params/cwd").unwrap(),
+            "/tmp/symphony-workspace"
+        );
+    }
+
+    #[test]
+    fn workspace_write_turn_sandbox_keeps_network_enabled_default() {
+        let mut config = test_config();
+        config.turn_sandbox_policy = "workspace-write".into();
+        let msg = turn_start_request("thread-1", "turn-1", "prompt", 2, &config);
+
+        assert_eq!(
+            msg.pointer("/params/sandboxPolicy").unwrap(),
+            &serde_json::json!({
+                "type": "workspaceWrite",
+                "networkAccess": true,
+            })
+        );
+    }
 }
