@@ -22,6 +22,8 @@ pub struct ServiceConfig {
     pub tracker_project_slug: Option<String>,
     pub tracker_active_states: Vec<String>,
     pub tracker_terminal_states: Vec<String>,
+    pub tracker_claim_state: Option<String>,
+    pub tracker_completion_state: Option<String>,
 
     // polling (§5.3.2)
     pub poll_interval_ms: u64,
@@ -41,8 +43,6 @@ pub struct ServiceConfig {
     pub agent_max_turns: u32,
     pub agent_max_retry_backoff_ms: u64,
     pub agent_max_concurrent_agents_by_state: HashMap<String, u32>,
-    pub agent_claim_state: Option<String>,
-    pub agent_completion_state: Option<String>,
 
     // codex (§5.3.6)
     pub codex_command: String,
@@ -78,6 +78,8 @@ impl Default for ServiceConfig {
                 "Duplicate".into(),
                 "Done".into(),
             ],
+            tracker_claim_state: None,
+            tracker_completion_state: None,
             poll_interval_ms: 30_000,
             workspace_root: String::new(), // filled during init
             hooks_after_create: None,
@@ -89,8 +91,6 @@ impl Default for ServiceConfig {
             agent_max_turns: 20,
             agent_max_retry_backoff_ms: 300_000,
             agent_max_concurrent_agents_by_state: HashMap::new(),
-            agent_claim_state: None,
-            agent_completion_state: None,
             codex_command: "codex app-server".into(),
             codex_approval_policy: Some(DEFAULT_CODEX_APPROVAL_POLICY.into()),
             codex_thread_sandbox: Some(DEFAULT_CODEX_THREAD_SANDBOX.into()),
@@ -125,6 +125,8 @@ struct RawTrackerConfig {
     project_slug: Option<String>,
     active_states: Option<Vec<String>>,
     terminal_states: Option<Vec<String>>,
+    claim_state: Option<String>,
+    completion_state: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -204,6 +206,8 @@ impl ServiceConfig {
             if let Some(states) = tracker.terminal_states {
                 sc.tracker_terminal_states = states;
             }
+            sc.tracker_claim_state = tracker.claim_state;
+            sc.tracker_completion_state = tracker.completion_state;
         }
 
         if let Some(polling) = raw.polling
@@ -245,8 +249,18 @@ impl ServiceConfig {
                     .map(|(state, max)| (state.to_lowercase(), max))
                     .collect();
             }
-            sc.agent_claim_state = agent.claim_state;
-            sc.agent_completion_state = agent.completion_state;
+            merge_tracker_handoff_state(
+                "tracker.claim_state",
+                "agent.claim_state",
+                &mut sc.tracker_claim_state,
+                agent.claim_state,
+            )?;
+            merge_tracker_handoff_state(
+                "tracker.completion_state",
+                "agent.completion_state",
+                &mut sc.tracker_completion_state,
+                agent.completion_state,
+            )?;
         }
 
         if let Some(codex) = raw.codex {
@@ -310,6 +324,7 @@ impl ServiceConfig {
     /// can safely dispatch work.
     pub fn validate_dispatch(&self) -> Result<(), ConfigError> {
         self.validate_codex_runtime_policy()?;
+        self.validate_tracker_handoff_policy()?;
 
         // Mock mode skips credential and project slug checks
         if self.mock_mode {
@@ -360,6 +375,27 @@ impl ServiceConfig {
             CODEX_SANDBOX_VALUES,
             normalize_codex_sandbox,
         )?;
+        Ok(())
+    }
+
+    fn validate_tracker_handoff_policy(&self) -> Result<(), ConfigError> {
+        validate_optional_non_empty("tracker.claim_state", self.tracker_claim_state.as_deref())?;
+        validate_optional_non_empty(
+            "tracker.completion_state",
+            self.tracker_completion_state.as_deref(),
+        )?;
+
+        if let Some(claim_state) = self.tracker_claim_state.as_deref()
+            && !self
+                .tracker_active_states
+                .iter()
+                .any(|state| state.eq_ignore_ascii_case(claim_state))
+        {
+            return Err(ConfigError::InvalidConfig(format!(
+                "tracker.claim_state must be listed in tracker.active_states: {claim_state}"
+            )));
+        }
+
         Ok(())
     }
 }
@@ -499,6 +535,37 @@ fn validate_optional_value(
     Ok(())
 }
 
+fn validate_optional_non_empty(field: &str, value: Option<&str>) -> Result<(), ConfigError> {
+    if let Some(value) = value
+        && value.trim().is_empty()
+    {
+        return Err(ConfigError::MissingField(field.into()));
+    }
+    Ok(())
+}
+
+fn merge_tracker_handoff_state(
+    preferred_field: &str,
+    alias_field: &str,
+    preferred_value: &mut Option<String>,
+    alias_value: Option<String>,
+) -> Result<(), ConfigError> {
+    let Some(alias_value) = alias_value else {
+        return Ok(());
+    };
+
+    if let Some(existing) = preferred_value.as_deref()
+        && existing != alias_value
+    {
+        return Err(ConfigError::InvalidConfig(format!(
+            "{alias_field} conflicts with {preferred_field}"
+        )));
+    }
+
+    *preferred_value = Some(alias_value);
+    Ok(())
+}
+
 fn invalid_value(field: &str, value: impl Into<String>, allowed: &'static str) -> ConfigError {
     ConfigError::InvalidValue {
         field: field.into(),
@@ -580,6 +647,62 @@ codex:
     }
 
     #[test]
+    fn test_config_from_yaml_tracker_handoff_policy() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tracker:
+  kind: linear
+  active_states:
+    - Todo
+    - In Progress
+  claim_state: In Progress
+  completion_state: In Review
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = ServiceConfig::from_yaml(&yaml, std::path::Path::new(".")).unwrap();
+        cfg.mock_mode = true;
+        assert_eq!(cfg.tracker_claim_state.as_deref(), Some("In Progress"));
+        assert_eq!(cfg.tracker_completion_state.as_deref(), Some("In Review"));
+        assert!(cfg.validate_dispatch().is_ok());
+    }
+
+    #[test]
+    fn test_config_accepts_legacy_agent_handoff_aliases() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+agent:
+  claim_state: In Progress
+  completion_state: In Review
+"#,
+        )
+        .unwrap();
+
+        let cfg = ServiceConfig::from_yaml(&yaml, std::path::Path::new(".")).unwrap();
+        assert_eq!(cfg.tracker_claim_state.as_deref(), Some("In Progress"));
+        assert_eq!(cfg.tracker_completion_state.as_deref(), Some("In Review"));
+    }
+
+    #[test]
+    fn test_config_rejects_conflicting_handoff_aliases() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tracker:
+  completion_state: In Review
+agent:
+  completion_state: Done
+"#,
+        )
+        .unwrap();
+
+        let err = ServiceConfig::from_yaml(&yaml, std::path::Path::new(".")).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidConfig(message) if message.contains("agent.completion_state conflicts with tracker.completion_state"))
+        );
+    }
+
+    #[test]
     fn test_config_rejects_unknown_keys() {
         let yaml: serde_yaml::Value = serde_yaml::from_str(
             r#"
@@ -640,5 +763,34 @@ codex:
             ..ServiceConfig::default()
         };
         assert!(cfg.validate_dispatch().is_err());
+    }
+
+    #[test]
+    fn test_validate_dispatch_rejects_empty_handoff_state() {
+        let cfg = ServiceConfig {
+            mock_mode: true,
+            tracker_completion_state: Some(" ".into()),
+            ..ServiceConfig::default()
+        };
+
+        assert!(
+            matches!(cfg.validate_dispatch(), Err(ConfigError::MissingField(field)) if field == "tracker.completion_state")
+        );
+    }
+
+    #[test]
+    fn test_validate_dispatch_rejects_claim_state_outside_active_states() {
+        let cfg = ServiceConfig {
+            mock_mode: true,
+            tracker_active_states: vec!["Todo".into()],
+            tracker_claim_state: Some("In Progress".into()),
+            ..ServiceConfig::default()
+        };
+
+        assert!(matches!(
+            cfg.validate_dispatch(),
+            Err(ConfigError::InvalidConfig(message))
+                if message.contains("tracker.claim_state must be listed in tracker.active_states")
+        ));
     }
 }

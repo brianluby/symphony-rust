@@ -3,6 +3,8 @@ tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
   project_slug: 5692ee81fcd8
+  claim_state: In Progress
+  completion_state: In Review
 
 polling:
   interval_ms: 30000
@@ -78,8 +80,6 @@ agent:
   max_concurrent_agents: 1
   max_turns: 20
   max_retry_backoff_ms: 300000
-  claim_state: In Progress
-  completion_state: In Review
 
 codex:
   command: codex app-server

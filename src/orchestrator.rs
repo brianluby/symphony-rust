@@ -255,7 +255,7 @@ impl Orchestrator {
         };
 
         let config_snapshot = self.config.read().await.clone();
-        if let Some(claim_state) = config_snapshot.agent_claim_state.as_deref()
+        if let Some(claim_state) = config_snapshot.tracker_claim_state.as_deref()
             && !issue.state.eq_ignore_ascii_case(claim_state)
         {
             match self
@@ -389,7 +389,7 @@ impl Orchestrator {
             let _permit = permit;
             let max_retry_backoff_ms = config.agent_max_retry_backoff_ms;
             let mock_mode = config.mock_agent;
-            let completion_state = config.agent_completion_state.clone();
+            let completion_state = config.tracker_completion_state.clone();
             let tracker_for_completion = tracker.clone();
             let outcome = run_worker(WorkerContext {
                 config,
@@ -667,7 +667,7 @@ impl Orchestrator {
 
                     // Dispatch via the same worker path
                     let cfg_snapshot = config.read().await.clone();
-                    if let Some(claim_state) = cfg_snapshot.agent_claim_state.as_deref()
+                    if let Some(claim_state) = cfg_snapshot.tracker_claim_state.as_deref()
                         && !issue.state.eq_ignore_ascii_case(claim_state)
                     {
                         match tracker.transition_issue_state(&issue_id, claim_state).await {
@@ -788,7 +788,7 @@ impl Orchestrator {
                         let _permit = permit;
                         let max_retry_backoff_ms = cfg.agent_max_retry_backoff_ms;
                         let mock_mode = cfg.mock_agent;
-                        let completion_state = cfg.agent_completion_state.clone();
+                        let completion_state = cfg.tracker_completion_state.clone();
                         let tracker_for_completion = tracker_clone.clone();
                         let outcome = run_worker(WorkerContext {
                             config: cfg,
@@ -1199,7 +1199,7 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
         read_timeout_ms: ctx.config.codex_read_timeout_ms,
         stall_timeout_ms: ctx.config.codex_stall_timeout_ms,
         max_turns,
-        stop_after_first_turn: ctx.config.agent_completion_state.is_some(),
+        stop_after_first_turn: ctx.config.tracker_completion_state.is_some(),
         on_session_update: Some(Arc::new(move |session| {
             if let Ok(mut state) = running_state.try_write()
                 && let Some(entry) = state.running.get_mut(&running_issue_id)
@@ -1492,7 +1492,7 @@ mod tests {
             mock_agent: false,
             codex_command: "sleep 10".into(),
             codex_stall_timeout_ms: 10_000,
-            agent_claim_state: Some("In Progress".into()),
+            tracker_claim_state: Some("In Progress".into()),
             ..ServiceConfig::default()
         };
         config.agent_max_retry_backoff_ms = 1_000;
@@ -1532,7 +1532,7 @@ mod tests {
             workspace_root: tmp.path().to_string_lossy().into_owned(),
             mock_mode: true,
             mock_agent: true,
-            agent_claim_state: Some("In Progress".into()),
+            tracker_claim_state: Some("In Progress".into()),
             ..ServiceConfig::default()
         };
         let workspace_mgr = WorkspaceManager::new(tmp.path().to_path_buf());
@@ -1560,7 +1560,7 @@ mod tests {
             workspace_root: tmp.path().to_string_lossy().into_owned(),
             mock_mode: true,
             mock_agent: true,
-            agent_completion_state: Some("In Review".into()),
+            tracker_completion_state: Some("In Review".into()),
             ..ServiceConfig::default()
         };
         let tracker = RecordingTracker::new();
