@@ -230,7 +230,7 @@ impl Orchestrator {
 
     // ── Dispatch ──────────────────────────────────────────────────────────
 
-    async fn dispatch_issue(&self, issue: Issue, attempt: Option<u32>) {
+    async fn dispatch_issue(&self, mut issue: Issue, attempt: Option<u32>) {
         let issue_id = issue.id.clone();
         let identifier = issue.identifier.clone();
 
@@ -253,6 +253,45 @@ impl Orchestrator {
                 return;
             }
         };
+
+        let config_snapshot = self.config.read().await.clone();
+        if let Some(claim_state) = config_snapshot.agent_claim_state.as_deref()
+            && !issue.state.eq_ignore_ascii_case(claim_state)
+        {
+            match self
+                .tracker
+                .transition_issue_state(&issue_id, claim_state)
+                .await
+            {
+                Ok(()) => {
+                    issue.state = claim_state.to_string();
+                    tracing::info!(
+                        issue_id = %issue_id,
+                        identifier = %identifier,
+                        state = %claim_state,
+                        "issue transitioned after claim"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        issue_id = %issue_id,
+                        identifier = %identifier,
+                        state = %claim_state,
+                        error = %e,
+                        "failed to transition issue after claim"
+                    );
+                    self.schedule_retry(
+                        &issue_id,
+                        &identifier,
+                        attempt.map_or(1, |a| a + 1),
+                        &format!("claim transition: {e}"),
+                    )
+                    .await;
+                    drop(permit);
+                    return;
+                }
+            }
+        }
 
         // Create workspace
         let workspace = match self.workspace_mgr.create_for_issue(&identifier).await {
@@ -285,7 +324,11 @@ impl Orchestrator {
         );
 
         // Run before_run hook
-        if let Err(e) = self.workspace_mgr.run_before_run(&workspace.path).await {
+        if let Err(e) = self
+            .workspace_mgr
+            .run_before_run(&workspace.path, &identifier)
+            .await
+        {
             tracing::error!(issue_id = %issue_id, error = %e, "before_run hook failed");
             self.schedule_retry(
                 &issue_id,
@@ -316,7 +359,7 @@ impl Orchestrator {
         }
 
         // Build prompt
-        let prompt_template = self.config.read().await.prompt_template.clone();
+        let prompt_template = config_snapshot.prompt_template.clone();
         let rendering = if prompt_template.is_empty() {
             format!(
                 "You are working on issue {}: {}.",
@@ -339,17 +382,20 @@ impl Orchestrator {
         let state_arc = self.state.clone();
         let wm = self.workspace_mgr.clone();
         let tracker = self.tracker.clone();
-        let config = self.config.read().await.clone();
+        let config = config_snapshot;
         let ws_path = workspace.path.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
             let max_retry_backoff_ms = config.agent_max_retry_backoff_ms;
             let mock_mode = config.mock_agent;
+            let completion_state = config.agent_completion_state.clone();
+            let tracker_for_completion = tracker.clone();
             let outcome = run_worker(WorkerContext {
                 config,
                 issue_id: issue_id.clone(),
                 identifier: identifier.clone(),
+                state: state_arc.clone(),
                 workspace_path: ws_path.clone(),
                 prompt: rendering,
                 attempt,
@@ -365,11 +411,34 @@ impl Orchestrator {
             }
 
             // Run after_run hook
-            wm.run_after_run(&ws_path).await;
+            wm.run_after_run(&ws_path, &identifier).await;
 
             if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                 tracing::info!(issue_id = %issue_id, "worker cancelled after hooks, skipping outcome reporting");
                 return;
+            }
+
+            if let WorkerOutcome::Normal { .. } = &outcome
+                && let Some(state_name) = completion_state.as_deref()
+            {
+                match tracker_for_completion
+                    .transition_issue_state(&issue_id, state_name)
+                    .await
+                {
+                    Ok(()) => tracing::info!(
+                        issue_id = %issue_id,
+                        identifier = %identifier,
+                        state = %state_name,
+                        "issue transitioned after successful worker run"
+                    ),
+                    Err(e) => tracing::error!(
+                        issue_id = %issue_id,
+                        identifier = %identifier,
+                        state = %state_name,
+                        error = %e,
+                        "failed to transition issue after successful worker run"
+                    ),
+                }
             }
 
             // Report outcome to orchestrator state
@@ -390,7 +459,7 @@ impl Orchestrator {
                     state.codex_totals.seconds_running += elapsed_seconds;
                     state.completed.insert(issue_id.clone());
 
-                    // Continuation retry per spec §7.4
+                    // Continuation retry per spec §7.4.
                     state.retry_attempts.insert(
                         issue_id.clone(),
                         RetryEntry {
@@ -551,7 +620,7 @@ impl Orchestrator {
                         }
                     };
 
-                    let issue = match candidates.iter().find(|i| i.id == issue_id) {
+                    let mut issue = match candidates.iter().find(|i| i.id == issue_id) {
                         Some(i) => i.clone(),
                         None => {
                             let mut s = state.write().await;
@@ -597,7 +666,38 @@ impl Orchestrator {
                     };
 
                     // Dispatch via the same worker path
-                    let prompt_template = config.read().await.prompt_template.clone();
+                    let cfg_snapshot = config.read().await.clone();
+                    if let Some(claim_state) = cfg_snapshot.agent_claim_state.as_deref()
+                        && !issue.state.eq_ignore_ascii_case(claim_state)
+                    {
+                        match tracker.transition_issue_state(&issue_id, claim_state).await {
+                            Ok(()) => {
+                                issue.state = claim_state.to_string();
+                                tracing::info!(
+                                    issue_id = %issue_id,
+                                    identifier = %issue.identifier,
+                                    state = %claim_state,
+                                    "retry issue transitioned after claim"
+                                );
+                            }
+                            Err(e) => {
+                                let mut s = state.write().await;
+                                s.retry_attempts.insert(
+                                    issue_id.clone(),
+                                    RetryEntry {
+                                        attempt: retry.attempt,
+                                        due_at_ms: 30_000,
+                                        error: Some(format!("claim transition: {e}")),
+                                        ..retry
+                                    },
+                                );
+                                drop(permit);
+                                continue;
+                            }
+                        }
+                    }
+
+                    let prompt_template = cfg_snapshot.prompt_template.clone();
                     let wm = workspace_mgr.clone();
                     let ws = match wm.create_for_issue(&issue.identifier).await {
                         Ok(ws) => ws,
@@ -617,7 +717,7 @@ impl Orchestrator {
                         }
                     };
 
-                    if let Err(e) = wm.run_before_run(&ws.path).await {
+                    if let Err(e) = wm.run_before_run(&ws.path, &issue.identifier).await {
                         let mut s = state.write().await;
                         s.retry_attempts.insert(
                             issue_id.clone(),
@@ -661,7 +761,7 @@ impl Orchestrator {
                     let state_arc = state.clone();
                     let tracker_clone = tracker.clone();
                     let wm_clone = wm.clone();
-                    let cfg = config.read().await.clone();
+                    let cfg = cfg_snapshot;
                     let ws_path = ws.path.clone();
                     let id = issue_id.clone();
                     let ident = issue.identifier.clone();
@@ -688,10 +788,13 @@ impl Orchestrator {
                         let _permit = permit;
                         let max_retry_backoff_ms = cfg.agent_max_retry_backoff_ms;
                         let mock_mode = cfg.mock_agent;
+                        let completion_state = cfg.agent_completion_state.clone();
+                        let tracker_for_completion = tracker_clone.clone();
                         let outcome = run_worker(WorkerContext {
                             config: cfg,
                             issue_id: id.clone(),
                             identifier: ident.clone(),
+                            state: state_arc.clone(),
                             workspace_path: ws_path.clone(),
                             prompt: rendering,
                             attempt: Some(retry.attempt),
@@ -706,11 +809,34 @@ impl Orchestrator {
                             return;
                         }
 
-                        wm_clone.run_after_run(&ws_path).await;
+                        wm_clone.run_after_run(&ws_path, &ident).await;
 
                         if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                             tracing::info!(issue_id = %id, "retry worker cancelled after hooks, skipping outcome reporting");
                             return;
+                        }
+
+                        if let WorkerOutcome::Normal { .. } = &outcome
+                            && let Some(state_name) = completion_state.as_deref()
+                        {
+                            match tracker_for_completion
+                                .transition_issue_state(&id, state_name)
+                                .await
+                            {
+                                Ok(()) => tracing::info!(
+                                    issue_id = %id,
+                                    identifier = %ident,
+                                    state = %state_name,
+                                    "issue transitioned after successful retry worker run"
+                                ),
+                                Err(e) => tracing::error!(
+                                    issue_id = %id,
+                                    identifier = %ident,
+                                    state = %state_name,
+                                    error = %e,
+                                    "failed to transition issue after successful retry worker run"
+                                ),
+                            }
                         }
 
                         let mut s = state_arc.write().await;
@@ -728,6 +854,7 @@ impl Orchestrator {
                                 s.codex_totals.output_tokens += tokens_out;
                                 s.codex_totals.total_tokens += tokens_in + tokens_out;
                                 s.codex_totals.seconds_running += elapsed_seconds;
+                                s.completed.insert(id.clone());
                                 s.retry_attempts.insert(
                                     id.clone(),
                                     RetryEntry {
@@ -997,6 +1124,7 @@ struct WorkerContext {
     config: ServiceConfig,
     issue_id: String,
     identifier: String,
+    state: Arc<RwLock<OrchestratorState>>,
     workspace_path: std::path::PathBuf,
     prompt: String,
     attempt: Option<u32>,
@@ -1009,6 +1137,8 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
     let start = tokio::time::Instant::now();
     let mut total_tokens_in: u64 = 0;
     let mut total_tokens_out: u64 = 0;
+    let running_state = ctx.state.clone();
+    let running_issue_id = ctx.issue_id.clone();
 
     if ctx.mock_mode {
         // Mock agent: simulate a session
@@ -1069,6 +1199,14 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
         read_timeout_ms: ctx.config.codex_read_timeout_ms,
         stall_timeout_ms: ctx.config.codex_stall_timeout_ms,
         max_turns,
+        stop_after_first_turn: ctx.config.agent_completion_state.is_some(),
+        on_session_update: Some(Arc::new(move |session| {
+            if let Ok(mut state) = running_state.try_write()
+                && let Some(entry) = state.running.get_mut(&running_issue_id)
+            {
+                entry.session = session;
+            }
+        })),
         cancelled: ctx.cancelled.clone(),
     };
 
@@ -1197,6 +1335,7 @@ pub fn compute_backoff(attempt: u32, max_backoff_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     struct EmptyTracker;
 
@@ -1216,6 +1355,14 @@ mod tests {
         async fn fetch_terminal_issues(&self) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
             Ok(Vec::new())
         }
+
+        async fn transition_issue_state(
+            &self,
+            _issue_id: &str,
+            _state_name: &str,
+        ) -> Result<(), crate::tracker::TrackerError> {
+            Ok(())
+        }
     }
 
     fn sample_issue() -> Issue {
@@ -1232,6 +1379,65 @@ mod tests {
             blocked_by: Vec::new(),
             created_at: None,
             updated_at: None,
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingTracker {
+        transitions: Arc<Mutex<Vec<(String, String)>>>,
+        fail_transitions: bool,
+    }
+
+    impl RecordingTracker {
+        fn new() -> Self {
+            Self {
+                transitions: Arc::new(Mutex::new(Vec::new())),
+                fail_transitions: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                transitions: Arc::new(Mutex::new(Vec::new())),
+                fail_transitions: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TrackerClient for RecordingTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            _ids: &[String],
+        ) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_terminal_issues(&self) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn transition_issue_state(
+            &self,
+            issue_id: &str,
+            state_name: &str,
+        ) -> Result<(), crate::tracker::TrackerError> {
+            self.transitions
+                .lock()
+                .unwrap()
+                .push((issue_id.to_string(), state_name.to_string()));
+
+            if self.fail_transitions {
+                Err(crate::tracker::TrackerError::MalformedPayload(
+                    "transition failed".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1275,5 +1481,113 @@ mod tests {
         );
 
         assert!(!orchestrator.should_dispatch(&issue, &config).await);
+    }
+
+    #[tokio::test]
+    async fn test_claim_transition_refreshes_running_issue_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = ServiceConfig {
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            mock_mode: true,
+            mock_agent: false,
+            codex_command: "sleep 10".into(),
+            codex_stall_timeout_ms: 10_000,
+            agent_claim_state: Some("In Progress".into()),
+            ..ServiceConfig::default()
+        };
+        config.agent_max_retry_backoff_ms = 1_000;
+
+        let tracker = RecordingTracker::new();
+        let transitions = tracker.transitions.clone();
+        let workspace_mgr = WorkspaceManager::new(tmp.path().to_path_buf());
+        let orchestrator = Orchestrator::new(
+            config,
+            Arc::new(tracker),
+            workspace_mgr,
+            tmp.path().join("WORKFLOW.md"),
+            None,
+        );
+        let issue = sample_issue();
+
+        orchestrator.dispatch_issue(issue.clone(), None).await;
+
+        let state = orchestrator.state.read().await;
+        let running = state.running.get(&issue.id).unwrap();
+        assert_eq!(running.issue.state, "In Progress");
+        running
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(state);
+
+        assert_eq!(
+            transitions.lock().unwrap().as_slice(),
+            &[("issue-1".into(), "In Progress".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_transition_failure_schedules_retry_and_releases_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = ServiceConfig {
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            mock_mode: true,
+            mock_agent: true,
+            agent_claim_state: Some("In Progress".into()),
+            ..ServiceConfig::default()
+        };
+        let workspace_mgr = WorkspaceManager::new(tmp.path().to_path_buf());
+        let orchestrator = Orchestrator::new(
+            config,
+            Arc::new(RecordingTracker::failing()),
+            workspace_mgr,
+            tmp.path().join("WORKFLOW.md"),
+            None,
+        );
+        let issue = sample_issue();
+
+        orchestrator.dispatch_issue(issue.clone(), None).await;
+
+        let state = orchestrator.state.read().await;
+        assert!(!state.claimed.contains(&issue.id));
+        assert!(!state.running.contains_key(&issue.id));
+        assert!(state.retry_attempts.contains_key(&issue.id));
+    }
+
+    #[tokio::test]
+    async fn test_completion_state_transition_runs_after_normal_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = ServiceConfig {
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            mock_mode: true,
+            mock_agent: true,
+            agent_completion_state: Some("In Review".into()),
+            ..ServiceConfig::default()
+        };
+        let tracker = RecordingTracker::new();
+        let transitions = tracker.transitions.clone();
+        let workspace_mgr = WorkspaceManager::new(tmp.path().to_path_buf());
+        let orchestrator = Orchestrator::new(
+            config,
+            Arc::new(tracker),
+            workspace_mgr,
+            tmp.path().join("WORKFLOW.md"),
+            None,
+        );
+
+        orchestrator.dispatch_issue(sample_issue(), None).await;
+
+        for _ in 0..20 {
+            if transitions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, state)| state == "In Review")
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("expected completion state transition to In Review");
     }
 }

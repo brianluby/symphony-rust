@@ -18,8 +18,12 @@ pub enum WorkspaceError {
     AfterCreateHook(String),
     #[error("before_run hook failed: {0}")]
     BeforeRunHook(String),
+    #[error("before_remove hook failed: {0}")]
+    BeforeRemoveHook(String),
     #[error("hook timed out after {0}ms")]
     HookTimeout(u64),
+    #[error("hook failed: {0}")]
+    HookFailed(String),
     #[error("workspace path is not a directory: {0}")]
     NotADirectory(PathBuf),
 }
@@ -64,10 +68,12 @@ impl WorkspaceManager {
 
             // Run after_create hook only on fresh creation
             if let Some(ref hook) = self.after_create {
-                self.run_hook(hook, &path).await.map_err(|e| match e {
-                    WorkspaceError::HookTimeout(ms) => WorkspaceError::HookTimeout(ms),
-                    other => WorkspaceError::AfterCreateHook(other.to_string()),
-                })?;
+                self.run_hook(hook, &path, identifier)
+                    .await
+                    .map_err(|e| match e {
+                        WorkspaceError::HookTimeout(ms) => WorkspaceError::HookTimeout(ms),
+                        other => WorkspaceError::AfterCreateHook(other.to_string()),
+                    })?;
             }
         } else if path.exists() && !path.is_dir() {
             return Err(WorkspaceError::NotADirectory(path));
@@ -81,9 +87,13 @@ impl WorkspaceManager {
     }
 
     /// Run the before_run hook. Failure aborts the current attempt.
-    pub async fn run_before_run(&self, workspace_path: &Path) -> Result<(), WorkspaceError> {
+    pub async fn run_before_run(
+        &self,
+        workspace_path: &Path,
+        identifier: &str,
+    ) -> Result<(), WorkspaceError> {
         if let Some(ref hook) = self.before_run {
-            self.run_hook(hook, workspace_path)
+            self.run_hook(hook, workspace_path, identifier)
                 .await
                 .map_err(|e| match e {
                     WorkspaceError::HookTimeout(ms) => WorkspaceError::HookTimeout(ms),
@@ -94,9 +104,9 @@ impl WorkspaceManager {
     }
 
     /// Run the after_run hook. Failure is logged but ignored.
-    pub async fn run_after_run(&self, workspace_path: &Path) {
+    pub async fn run_after_run(&self, workspace_path: &Path, identifier: &str) {
         if let Some(ref hook) = self.after_run
-            && let Err(e) = self.run_hook(hook, workspace_path).await
+            && let Err(e) = self.run_hook(hook, workspace_path, identifier).await
         {
             tracing::debug!(
                 workspace = %workspace_path.display(),
@@ -106,17 +116,21 @@ impl WorkspaceManager {
         }
     }
 
-    /// Run the before_remove hook. Failure is logged but ignored.
-    pub async fn run_before_remove(&self, workspace_path: &Path) {
+    /// Run the before_remove hook. Failure aborts workspace removal.
+    pub async fn run_before_remove(
+        &self,
+        workspace_path: &Path,
+        identifier: &str,
+    ) -> Result<(), WorkspaceError> {
         if let Some(ref hook) = self.before_remove
-            && let Err(e) = self.run_hook(hook, workspace_path).await
+            && let Err(e) = self.run_hook(hook, workspace_path, identifier).await
         {
-            tracing::debug!(
-                workspace = %workspace_path.display(),
-                error = %e,
-                "before_remove hook failed (ignored)"
-            );
+            return Err(match e {
+                WorkspaceError::HookTimeout(ms) => WorkspaceError::HookTimeout(ms),
+                other => WorkspaceError::BeforeRemoveHook(other.to_string()),
+            });
         }
+        Ok(())
     }
 
     /// Remove a workspace directory (with before_remove hook).
@@ -125,7 +139,14 @@ impl WorkspaceManager {
         let path = self.root.join(&key);
 
         if path.exists() {
-            self.run_before_remove(&path).await;
+            if let Err(e) = self.run_before_remove(&path, identifier).await {
+                tracing::error!(
+                    workspace = %path.display(),
+                    error = %e,
+                    "before_remove hook failed, preserving workspace"
+                );
+                return;
+            }
 
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 tracing::error!(
@@ -139,18 +160,30 @@ impl WorkspaceManager {
 
     /// Run a shell hook script with a timeout. Uses tokio::process so the
     /// hook process is killed when the timeout expires.
-    async fn run_hook(&self, script: &str, workspace_path: &Path) -> Result<(), WorkspaceError> {
+    async fn run_hook(
+        &self,
+        script: &str,
+        workspace_path: &Path,
+        identifier: &str,
+    ) -> Result<(), WorkspaceError> {
         let timeout_ms = self.hook_timeout_ms;
+        let workspace_key = workspace_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(identifier);
 
         let child = tokio::process::Command::new("bash")
             .arg("-lc")
             .arg(script)
             .current_dir(workspace_path)
+            .env("SYMPHONY_WORKSPACE", workspace_path)
+            .env("SYMPHONY_WORKSPACE_KEY", workspace_key)
+            .env("SYMPHONY_ISSUE_IDENTIFIER", identifier)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| WorkspaceError::AfterCreateHook(e.to_string()))?;
+            .map_err(|e| WorkspaceError::HookFailed(e.to_string()))?;
 
         let result =
             tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await;
@@ -162,11 +195,11 @@ impl WorkspaceManager {
                         .chars()
                         .take(500)
                         .collect();
-                    return Err(WorkspaceError::AfterCreateHook(stderr));
+                    return Err(WorkspaceError::HookFailed(stderr));
                 }
                 Ok(())
             }
-            Ok(Err(e)) => Err(WorkspaceError::AfterCreateHook(e.to_string())),
+            Ok(Err(e)) => Err(WorkspaceError::HookFailed(e.to_string())),
             Err(_elapsed) => Err(WorkspaceError::HookTimeout(timeout_ms)),
         }
     }
@@ -202,6 +235,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hooks_receive_workspace_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = WorkspaceManager::new(tmp.path().to_path_buf());
+        mgr.after_create = Some(
+            "printf '%s|%s|%s' \"$SYMPHONY_ISSUE_IDENTIFIER\" \"$SYMPHONY_WORKSPACE_KEY\" \"$SYMPHONY_WORKSPACE\" > hook-env.txt"
+                .into(),
+        );
+
+        let ws = mgr.create_for_issue("TEAM/ISSUE:1").await.unwrap();
+        let content = std::fs::read_to_string(ws.path.join("hook-env.txt")).unwrap();
+
+        assert_eq!(
+            content,
+            format!("TEAM/ISSUE:1|TEAM_ISSUE_1|{}", ws.path.to_string_lossy())
+        );
+    }
+
+    #[tokio::test]
     async fn test_remove_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = WorkspaceManager::new(tmp.path().to_path_buf());
@@ -214,7 +265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_before_remove_hook_timeout_does_not_block_removal() {
+    async fn test_before_remove_hook_timeout_preserves_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let mut mgr = WorkspaceManager::new(tmp.path().to_path_buf());
         mgr.before_remove = Some("sleep 2".into());
@@ -223,7 +274,7 @@ mod tests {
         mgr.create_for_issue("T-100").await.unwrap();
         mgr.remove_workspace("T-100").await;
 
-        assert!(!mgr.root.join("T-100").exists());
+        assert!(mgr.root.join("T-100").exists());
     }
 
     #[tokio::test]
