@@ -416,9 +416,9 @@ fn approval_policy_wire(policy: &str) -> &'static str {
 
 fn thread_sandbox_wire(sandbox: &str) -> &'static str {
     match sandbox {
-        "read-only" => "readOnly",
-        "workspace-write" => "workspaceWrite",
-        "danger-full-access" => "dangerFullAccess",
+        "read-only" => "read-only",
+        "workspace-write" => "workspace-write",
+        "danger-full-access" => "danger-full-access",
         _ => thread_sandbox_wire(DEFAULT_CODEX_THREAD_SANDBOX),
     }
 }
@@ -788,7 +788,10 @@ mod tests {
 
         assert_eq!(msg["method"], "thread/start");
         assert_eq!(msg.pointer("/params/approvalPolicy").unwrap(), "onRequest");
-        assert_eq!(msg.pointer("/params/sandbox").unwrap(), "dangerFullAccess");
+        assert_eq!(
+            msg.pointer("/params/sandbox").unwrap(),
+            "danger-full-access"
+        );
         assert_eq!(
             msg.pointer("/params/cwd").unwrap(),
             "/tmp/symphony-workspace"
