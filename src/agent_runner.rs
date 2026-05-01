@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -26,7 +27,7 @@ pub enum AgentOutcome {
 }
 
 /// Configuration for the agent runner.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentRunnerConfig {
     pub command: String,
     pub workspace_path: PathBuf,
@@ -36,6 +37,8 @@ pub struct AgentRunnerConfig {
     pub read_timeout_ms: u64,
     pub stall_timeout_ms: u64,
     pub max_turns: u32,
+    pub stop_after_first_turn: bool,
+    pub on_session_update: Option<Arc<dyn Fn(LiveSession) + Send + Sync>>,
     pub cancelled: CancelHandle,
 }
 
@@ -112,16 +115,22 @@ pub async fn run_agent_attempt(
 
     let mut turn_number: u32 = 1;
     let max_turns = config.max_turns;
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let thread_id = format!("thread-{}", &session_id[..8]);
+    let workspace_cwd = std::fs::canonicalize(&config.workspace_path)
+        .unwrap_or_else(|_| config.workspace_path.clone());
 
-    // ── Send initial session setup ──
-    let setup_msg = serde_json::json!({
+    // ── Initialize app-server connection ──
+    let initialize_msg = serde_json::json!({
         "jsonrpc": "2.0",
-        "method": "v2/ThreadStart",
+        "method": "initialize",
         "params": {
-            "threadId": thread_id,
-            "prompt": prompt,
+            "clientInfo": {
+                "name": "symphony",
+                "title": "Symphony",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true
+            }
         },
         "id": 1
     });
@@ -139,6 +148,46 @@ pub async fn run_agent_attempt(
 
     {
         use tokio::io::AsyncWriteExt;
+        let msg_str = serde_json::to_string(&initialize_msg).unwrap();
+        if child_stdin
+            .write_all(format!("{}\n", msg_str).as_bytes())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+            return AgentOutcome::Error {
+                error: "failed to write initialize request to agent stdin".into(),
+                entry,
+            };
+        }
+    }
+
+    if let Err(e) =
+        read_initialize_response(&mut lines, &mut entry, config.on_session_update.as_deref()).await
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        stderr_task.abort();
+        return AgentOutcome::Error {
+            error: format!("initialize failed: {e:?}"),
+            entry,
+        };
+    }
+
+    // ── Send initial thread setup ──
+    let setup_msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "thread/start",
+        "params": {
+            "cwd": workspace_cwd,
+            "approvalPolicy": "never",
+            "sandbox": "workspace-write",
+        },
+        "id": 2
+    });
+
+    {
+        use tokio::io::AsyncWriteExt;
         let msg_str = serde_json::to_string(&setup_msg).unwrap();
         if child_stdin
             .write_all(format!("{}\n", msg_str).as_bytes())
@@ -153,8 +202,26 @@ pub async fn run_agent_attempt(
         }
     }
 
+    let thread_id = match read_thread_start_response(
+        &mut lines,
+        &mut entry,
+        config.on_session_update.as_deref(),
+    )
+    .await
+    {
+        Ok(thread_id) => thread_id,
+        Err(e) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return AgentOutcome::Error {
+                error: format!("thread start failed: {e:?}"),
+                entry,
+            };
+        }
+    };
+
     entry.session.thread_id = Some(thread_id.clone());
-    entry.session.turn_count = 1;
 
     // ── Turn loop ──
     loop {
@@ -168,23 +235,63 @@ pub async fn run_agent_attempt(
             };
         }
 
-        let turn_id = format!(
-            "turn-{}",
-            uuid::Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("0")
-        );
+        let turn_id = format!("pending-{turn_number}");
         entry.session.session_id = Some(make_session_id(&thread_id, &turn_id));
-        entry.session.turn_id = Some(turn_id.clone());
+        entry.session.turn_id = Some(turn_id);
+        entry.session.turn_count = u64::from(turn_number);
+
+        let turn_prompt = if turn_number == 1 {
+            prompt.clone()
+        } else {
+            continuation_template(turn_number, max_turns)
+        };
+
+        let turn_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": turn_prompt,
+                        "text_elements": []
+                    }
+                ],
+                "approvalPolicy": "never",
+                "sandboxPolicy": {
+                    "type": "workspaceWrite",
+                    "writableRoots": [workspace_cwd],
+                    "networkAccess": true,
+                    "excludeTmpdirEnvVar": false,
+                    "excludeSlashTmp": false
+                }
+            },
+            "id": turn_number + 2
+        });
+
+        {
+            use tokio::io::AsyncWriteExt;
+            let msg_str = serde_json::to_string(&turn_msg).unwrap();
+            if child_stdin
+                .write_all(format!("{}\n", msg_str).as_bytes())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+                return AgentOutcome::Error {
+                    error: "failed to write turn start to agent stdin".into(),
+                    entry,
+                };
+            }
+        }
 
         // Read events from agent with stall detection
         let read_result = if config.stall_timeout_ms > 0 {
             tokio::select! {
                 result = timeout(
                     Duration::from_millis(config.stall_timeout_ms),
-                    read_agent_events(&mut lines, &mut entry),
+                    read_agent_events(&mut lines, &mut entry, config.on_session_update.as_deref()),
                 ) => result,
                 () = wait_for_cancel(config.cancelled.clone()) => {
                     let _ = child.kill().await;
@@ -198,7 +305,7 @@ pub async fn run_agent_attempt(
             }
         } else {
             tokio::select! {
-                result = read_agent_events(&mut lines, &mut entry) => Ok(result),
+                result = read_agent_events(&mut lines, &mut entry, config.on_session_update.as_deref()) => Ok(result),
                 () = wait_for_cancel(config.cancelled.clone()) => {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -229,36 +336,15 @@ pub async fn run_agent_attempt(
                     break;
                 }
 
-                // For continuation, send minimal prompt
-                turn_number += 1;
-                let continuation = continuation_template(turn_number, max_turns);
-
-                let cont_msg = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "v2/TurnStart",
-                    "params": {
-                        "threadId": thread_id,
-                        "turnId": turn_id,
-                        "prompt": continuation,
-                    },
-                    "id": turn_number
-                });
-
-                {
-                    use tokio::io::AsyncWriteExt;
-                    let msg_str = serde_json::to_string(&cont_msg).unwrap();
-                    if child_stdin
-                        .write_all(format!("{}\n", msg_str).as_bytes())
-                        .await
-                        .is_err()
-                    {
-                        let _ = child.kill().await;
-                        return AgentOutcome::Error {
-                            error: "agent stdin closed unexpectedly".into(),
-                            entry,
-                        };
-                    }
+                if config.stop_after_first_turn {
+                    tracing::info!(
+                        issue_id = %entry.issue_id,
+                        "completion workflow configured, stopping after first turn"
+                    );
+                    break;
                 }
+
+                turn_number += 1;
             }
             Ok(Err(EventError::Exit)) => {
                 // Agent exited
@@ -324,9 +410,93 @@ enum EventError {
     TurnFailed(String),
 }
 
+async fn read_initialize_response(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    entry: &mut RunningEntry,
+    on_session_update: Option<&(dyn Fn(LiveSession) + Send + Sync)>,
+) -> Result<(), EventError> {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return Err(EventError::Exit),
+            Err(e) => return Err(EventError::TurnFailed(e.to_string())),
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let msg: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(line = %line, "non-JSON agent output");
+                continue;
+            }
+        };
+
+        if let Some(error) = json_rpc_error_message(&msg) {
+            return Err(EventError::TurnFailed(error));
+        }
+
+        if msg.get("id").and_then(|v| v.as_u64()) == Some(1) && msg.get("result").is_some() {
+            entry.session.last_codex_event = Some("initialize".to_string());
+            entry.session.last_codex_timestamp = Some(chrono::Utc::now());
+            publish_session_update(entry, on_session_update);
+            return Ok(());
+        }
+    }
+}
+
+async fn read_thread_start_response(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    entry: &mut RunningEntry,
+    on_session_update: Option<&(dyn Fn(LiveSession) + Send + Sync)>,
+) -> Result<String, EventError> {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return Err(EventError::Exit),
+            Err(e) => return Err(EventError::TurnFailed(e.to_string())),
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let msg: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(line = %line, "non-JSON agent output");
+                continue;
+            }
+        };
+
+        if let Some(error) = json_rpc_error_message(&msg) {
+            return Err(EventError::TurnFailed(error));
+        }
+
+        if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
+            entry.session.last_codex_event = Some(method.to_string());
+            entry.session.last_codex_timestamp = Some(chrono::Utc::now());
+            publish_session_update(entry, on_session_update);
+        }
+
+        if let Some(thread_id) = msg
+            .pointer("/result/thread/id")
+            .or_else(|| msg.pointer("/params/thread/id"))
+            .and_then(|v| v.as_str())
+        {
+            entry.session.thread_id = Some(thread_id.to_string());
+            publish_session_update(entry, on_session_update);
+            return Ok(thread_id.to_string());
+        }
+    }
+}
+
 async fn read_agent_events(
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     entry: &mut RunningEntry,
+    on_session_update: Option<&(dyn Fn(LiveSession) + Send + Sync)>,
 ) -> Result<(), EventError> {
     loop {
         let line = match lines.next_line().await {
@@ -348,6 +518,10 @@ async fn read_agent_events(
             }
         };
 
+        if let Some(error) = json_rpc_error_message(&msg) {
+            return Err(EventError::TurnFailed(error));
+        }
+
         let event_type = msg
             .get("method")
             .or_else(|| msg.get("result").and_then(|r| r.get("type")))
@@ -358,11 +532,35 @@ async fn read_agent_events(
         entry.session.last_codex_message = msg
             .get("result")
             .and_then(|r| r.get("message"))
+            .or_else(|| msg.pointer("/params/message"))
             .and_then(|m| m.as_str())
             .map(String::from);
 
+        if let Some(thread_id) = msg
+            .pointer("/result/thread/id")
+            .or_else(|| msg.pointer("/params/threadId"))
+            .or_else(|| msg.pointer("/params/thread/id"))
+            .and_then(|v| v.as_str())
+        {
+            entry.session.thread_id = Some(thread_id.to_string());
+        }
+
+        if let Some(turn_id) = msg
+            .pointer("/result/turn/id")
+            .or_else(|| msg.pointer("/params/turn/id"))
+            .and_then(|v| v.as_str())
+        {
+            entry.session.turn_id = Some(turn_id.to_string());
+            if let Some(thread_id) = entry.session.thread_id.as_deref() {
+                entry.session.session_id = Some(make_session_id(thread_id, turn_id));
+            }
+        }
+
         // Parse token usage if present
-        if let Some(usage) = msg.pointer("/result/usage") {
+        if let Some(usage) = msg
+            .pointer("/result/usage")
+            .or_else(|| msg.pointer("/params/tokenUsage/last"))
+        {
             if let Some(input) = usage.get("inputTokens").and_then(|v| v.as_u64()) {
                 entry.session.codex_input_tokens += input;
                 entry.session.last_reported_input_tokens = input;
@@ -373,9 +571,32 @@ async fn read_agent_events(
             }
         }
 
+        if let Some(total) = msg.pointer("/params/tokenUsage/total") {
+            if let Some(input) = total.get("inputTokens").and_then(|v| v.as_u64()) {
+                entry.session.codex_input_tokens = input;
+            }
+            if let Some(output) = total.get("outputTokens").and_then(|v| v.as_u64()) {
+                entry.session.codex_output_tokens = output;
+            }
+            if let Some(total_tokens) = total.get("totalTokens").and_then(|v| v.as_u64()) {
+                entry.session.codex_total_tokens = total_tokens;
+            }
+        }
+
+        publish_session_update(entry, on_session_update);
+
         match event_type {
-            Some("v2/TurnCompleted") | Some("turn_completed") => {
+            Some("v2/TurnCompleted") | Some("turn_completed") | Some("turn/completed") => {
                 tracing::info!(session = ?entry.session.session_id, "turn completed event");
+                if let Some(status) = msg.pointer("/params/turn/status").and_then(|v| v.as_str())
+                    && status == "failed"
+                {
+                    let reason = msg
+                        .pointer("/params/turn/error/message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("turn failed");
+                    return Err(EventError::TurnFailed(reason.to_string()));
+                }
                 return Ok(());
             }
             Some("v2/TurnFailed") | Some("turn_failed") => {
@@ -393,6 +614,29 @@ async fn read_agent_events(
                 tracing::trace!(event = ?event_type, "agent event");
             }
         }
+    }
+}
+
+fn json_rpc_error_message(msg: &serde_json::Value) -> Option<String> {
+    let error = msg.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("JSON-RPC error");
+    let code = error.get("code").and_then(|v| v.as_i64());
+
+    Some(match code {
+        Some(code) => format!("JSON-RPC error {code}: {message}"),
+        None => format!("JSON-RPC error: {message}"),
+    })
+}
+
+fn publish_session_update(
+    entry: &RunningEntry,
+    on_session_update: Option<&(dyn Fn(LiveSession) + Send + Sync)>,
+) {
+    if let Some(callback) = on_session_update {
+        callback(entry.session.clone());
     }
 }
 

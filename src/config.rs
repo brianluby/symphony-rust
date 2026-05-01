@@ -34,6 +34,8 @@ pub struct ServiceConfig {
     pub agent_max_turns: u32,
     pub agent_max_retry_backoff_ms: u64,
     pub agent_max_concurrent_agents_by_state: HashMap<String, u32>,
+    pub agent_claim_state: Option<String>,
+    pub agent_completion_state: Option<String>,
 
     // codex (§5.3.6)
     pub codex_command: String,
@@ -80,6 +82,8 @@ impl Default for ServiceConfig {
             agent_max_turns: 20,
             agent_max_retry_backoff_ms: 300_000,
             agent_max_concurrent_agents_by_state: HashMap::new(),
+            agent_claim_state: None,
+            agent_completion_state: None,
             codex_command: "codex app-server".into(),
             codex_approval_policy: None,
             codex_thread_sandbox: None,
@@ -145,6 +149,8 @@ struct RawAgentConfig {
     max_turns: Option<u32>,
     max_retry_backoff_ms: Option<u64>,
     max_concurrent_agents_by_state: Option<HashMap<String, u32>>,
+    claim_state: Option<String>,
+    completion_state: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -232,6 +238,8 @@ impl ServiceConfig {
                     .map(|(state, max)| (state.to_lowercase(), max))
                     .collect();
             }
+            sc.agent_claim_state = agent.claim_state;
+            sc.agent_completion_state = agent.completion_state;
         }
 
         if let Some(codex) = raw.codex {
