@@ -100,6 +100,7 @@ impl LinearClient {
                 .text()
                 .await
                 .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+            let body = truncate_response_body(body, 1024);
             return Err(TrackerError::HttpStatus { status, body });
         }
 
@@ -473,16 +474,14 @@ fn parse_candidate_issues(json: &serde_json::Value) -> Result<Vec<Issue>, String
 
                             let issue_ref = &r["issue"];
                             let related_issue_ref = &r["relatedIssue"];
-                            let blocker = if related_issue_ref["id"].as_str() == Some(id.as_str()) {
-                                issue_ref
-                            } else {
-                                related_issue_ref
-                            };
+                            if related_issue_ref["id"].as_str() != Some(id.as_str()) {
+                                return None;
+                            }
 
                             Some(crate::types::BlockerRef {
-                                id: blocker["id"].as_str().map(String::from),
-                                identifier: blocker["identifier"].as_str().map(String::from),
-                                state: blocker["state"]["name"].as_str().map(String::from),
+                                id: issue_ref["id"].as_str().map(String::from),
+                                identifier: issue_ref["identifier"].as_str().map(String::from),
+                                state: issue_ref["state"]["name"].as_str().map(String::from),
                             })
                         })
                         .collect()
@@ -514,6 +513,16 @@ fn parse_candidate_issues(json: &serde_json::Value) -> Result<Vec<Issue>, String
             })
         })
         .collect()
+}
+
+fn truncate_response_body(body: String, max_chars: usize) -> String {
+    let mut chars = body.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +572,19 @@ mod tests {
                                             "identifier": "MT-2",
                                             "state": { "name": "Todo" }
                                         }
+                                    },
+                                    {
+                                        "type": "blocks",
+                                        "issue": {
+                                            "id": "abc123",
+                                            "identifier": "MT-1",
+                                            "state": { "name": "Todo" }
+                                        },
+                                        "relatedIssue": {
+                                            "id": "blocked-by-current",
+                                            "identifier": "MT-3",
+                                            "state": { "name": "Todo" }
+                                        }
                                     }
                                 ]
                             },
@@ -580,5 +602,12 @@ mod tests {
         assert_eq!(issues[0].labels, vec!["bug"]);
         assert_eq!(issues[0].blocked_by.len(), 1);
         assert_eq!(issues[0].blocked_by[0].identifier.as_deref(), Some("MT-0"));
+    }
+
+    #[test]
+    fn truncates_long_response_bodies() {
+        let body = "abcdef".to_string();
+        assert_eq!(truncate_response_body(body, 3), "abc...");
+        assert_eq!(truncate_response_body("abc".into(), 3), "abc");
     }
 }

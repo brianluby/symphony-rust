@@ -14,10 +14,10 @@ hooks:
   timeout_ms: 120000
   after_create: |
     set -euo pipefail
-    repo_root="/Volumes/raid1/repos/symphony-rust"
     workspace_path="$(pwd -P)"
+    repo_root="${SYMPHONY_REPO_ROOT:-$(git -C "$workspace_path/../.." rev-parse --show-toplevel)}"
     worktree_path="$workspace_path/repo"
-    branch="symphony/$SYMPHONY_ISSUE_IDENTIFIER"
+    branch="symphony/$SYMPHONY_WORKSPACE_KEY"
 
     if [ -d "$worktree_path/.git" ] || [ -f "$worktree_path/.git" ]; then
       exit 0
@@ -40,10 +40,10 @@ hooks:
 
   before_run: |
     set -euo pipefail
-    repo_root="/Volumes/raid1/repos/symphony-rust"
     workspace_path="$(pwd -P)"
+    repo_root="${SYMPHONY_REPO_ROOT:-$(git -C "$workspace_path/../.." rev-parse --show-toplevel)}"
     worktree_path="$workspace_path/repo"
-    branch="symphony/$SYMPHONY_ISSUE_IDENTIFIER"
+    branch="symphony/$SYMPHONY_WORKSPACE_KEY"
 
     if [ ! -d "$worktree_path/.git" ] && [ ! -f "$worktree_path/.git" ]; then
       if [ -d "$worktree_path" ]; then
@@ -66,8 +66,8 @@ hooks:
 
   before_remove: |
     set -euo pipefail
-    repo_root="/Volumes/raid1/repos/symphony-rust"
     workspace_path="$(pwd -P)"
+    repo_root="${SYMPHONY_REPO_ROOT:-$(git -C "$workspace_path/../.." rev-parse --show-toplevel)}"
     worktree_path="$workspace_path/repo"
 
     if [ -d "$worktree_path" ]; then

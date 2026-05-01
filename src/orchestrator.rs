@@ -230,7 +230,7 @@ impl Orchestrator {
 
     // ── Dispatch ──────────────────────────────────────────────────────────
 
-    async fn dispatch_issue(&self, issue: Issue, attempt: Option<u32>) {
+    async fn dispatch_issue(&self, mut issue: Issue, attempt: Option<u32>) {
         let issue_id = issue.id.clone();
         let identifier = issue.identifier.clone();
 
@@ -263,12 +263,15 @@ impl Orchestrator {
                 .transition_issue_state(&issue_id, claim_state)
                 .await
             {
-                Ok(()) => tracing::info!(
-                    issue_id = %issue_id,
-                    identifier = %identifier,
-                    state = %claim_state,
-                    "issue transitioned after claim"
-                ),
+                Ok(()) => {
+                    issue.state = claim_state.to_string();
+                    tracing::info!(
+                        issue_id = %issue_id,
+                        identifier = %identifier,
+                        state = %claim_state,
+                        "issue transitioned after claim"
+                    );
+                }
                 Err(e) => {
                     tracing::error!(
                         issue_id = %issue_id,
@@ -617,7 +620,7 @@ impl Orchestrator {
                         }
                     };
 
-                    let issue = match candidates.iter().find(|i| i.id == issue_id) {
+                    let mut issue = match candidates.iter().find(|i| i.id == issue_id) {
                         Some(i) => i.clone(),
                         None => {
                             let mut s = state.write().await;
@@ -668,12 +671,15 @@ impl Orchestrator {
                         && !issue.state.eq_ignore_ascii_case(claim_state)
                     {
                         match tracker.transition_issue_state(&issue_id, claim_state).await {
-                            Ok(()) => tracing::info!(
-                                issue_id = %issue_id,
-                                identifier = %issue.identifier,
-                                state = %claim_state,
-                                "retry issue transitioned after claim"
-                            ),
+                            Ok(()) => {
+                                issue.state = claim_state.to_string();
+                                tracing::info!(
+                                    issue_id = %issue_id,
+                                    identifier = %issue.identifier,
+                                    state = %claim_state,
+                                    "retry issue transitioned after claim"
+                                );
+                            }
                             Err(e) => {
                                 let mut s = state.write().await;
                                 s.retry_attempts.insert(
@@ -1174,20 +1180,32 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
     let agent_cfg = crate::agent_runner::AgentRunnerConfig {
         command: ctx.config.codex_command.clone(),
         workspace_path: ctx.workspace_path.clone(),
+        approval_policy: ctx
+            .config
+            .codex_approval_policy
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_CODEX_APPROVAL_POLICY.into()),
+        thread_sandbox: ctx
+            .config
+            .codex_thread_sandbox
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_CODEX_THREAD_SANDBOX.into()),
+        turn_sandbox_policy: ctx
+            .config
+            .codex_turn_sandbox_policy
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_CODEX_TURN_SANDBOX_POLICY.into()),
         turn_timeout_ms: ctx.config.codex_turn_timeout_ms,
         read_timeout_ms: ctx.config.codex_read_timeout_ms,
         stall_timeout_ms: ctx.config.codex_stall_timeout_ms,
         max_turns,
         stop_after_first_turn: ctx.config.agent_completion_state.is_some(),
         on_session_update: Some(Arc::new(move |session| {
-            let state = running_state.clone();
-            let issue_id = running_issue_id.clone();
-            tokio::spawn(async move {
-                let mut state = state.write().await;
-                if let Some(entry) = state.running.get_mut(&issue_id) {
-                    entry.session = session;
-                }
-            });
+            if let Ok(mut state) = running_state.try_write()
+                && let Some(entry) = state.running.get_mut(&running_issue_id)
+            {
+                entry.session = session;
+            }
         })),
         cancelled: ctx.cancelled.clone(),
     };
@@ -1317,6 +1335,7 @@ pub fn compute_backoff(attempt: u32, max_backoff_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     struct EmptyTracker;
 
@@ -1363,6 +1382,65 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordingTracker {
+        transitions: Arc<Mutex<Vec<(String, String)>>>,
+        fail_transitions: bool,
+    }
+
+    impl RecordingTracker {
+        fn new() -> Self {
+            Self {
+                transitions: Arc::new(Mutex::new(Vec::new())),
+                fail_transitions: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                transitions: Arc::new(Mutex::new(Vec::new())),
+                fail_transitions: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TrackerClient for RecordingTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            _ids: &[String],
+        ) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_terminal_issues(&self) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn transition_issue_state(
+            &self,
+            issue_id: &str,
+            state_name: &str,
+        ) -> Result<(), crate::tracker::TrackerError> {
+            self.transitions
+                .lock()
+                .unwrap()
+                .push((issue_id.to_string(), state_name.to_string()));
+
+            if self.fail_transitions {
+                Err(crate::tracker::TrackerError::MalformedPayload(
+                    "transition failed".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn test_compute_backoff() {
         assert_eq!(compute_backoff(1, 300_000), 10_000);
@@ -1403,5 +1481,113 @@ mod tests {
         );
 
         assert!(!orchestrator.should_dispatch(&issue, &config).await);
+    }
+
+    #[tokio::test]
+    async fn test_claim_transition_refreshes_running_issue_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = ServiceConfig {
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            mock_mode: true,
+            mock_agent: false,
+            codex_command: "sleep 10".into(),
+            codex_stall_timeout_ms: 10_000,
+            agent_claim_state: Some("In Progress".into()),
+            ..ServiceConfig::default()
+        };
+        config.agent_max_retry_backoff_ms = 1_000;
+
+        let tracker = RecordingTracker::new();
+        let transitions = tracker.transitions.clone();
+        let workspace_mgr = WorkspaceManager::new(tmp.path().to_path_buf());
+        let orchestrator = Orchestrator::new(
+            config,
+            Arc::new(tracker),
+            workspace_mgr,
+            tmp.path().join("WORKFLOW.md"),
+            None,
+        );
+        let issue = sample_issue();
+
+        orchestrator.dispatch_issue(issue.clone(), None).await;
+
+        let state = orchestrator.state.read().await;
+        let running = state.running.get(&issue.id).unwrap();
+        assert_eq!(running.issue.state, "In Progress");
+        running
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(state);
+
+        assert_eq!(
+            transitions.lock().unwrap().as_slice(),
+            &[("issue-1".into(), "In Progress".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_transition_failure_schedules_retry_and_releases_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = ServiceConfig {
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            mock_mode: true,
+            mock_agent: true,
+            agent_claim_state: Some("In Progress".into()),
+            ..ServiceConfig::default()
+        };
+        let workspace_mgr = WorkspaceManager::new(tmp.path().to_path_buf());
+        let orchestrator = Orchestrator::new(
+            config,
+            Arc::new(RecordingTracker::failing()),
+            workspace_mgr,
+            tmp.path().join("WORKFLOW.md"),
+            None,
+        );
+        let issue = sample_issue();
+
+        orchestrator.dispatch_issue(issue.clone(), None).await;
+
+        let state = orchestrator.state.read().await;
+        assert!(!state.claimed.contains(&issue.id));
+        assert!(!state.running.contains_key(&issue.id));
+        assert!(state.retry_attempts.contains_key(&issue.id));
+    }
+
+    #[tokio::test]
+    async fn test_completion_state_transition_runs_after_normal_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = ServiceConfig {
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            mock_mode: true,
+            mock_agent: true,
+            agent_completion_state: Some("In Review".into()),
+            ..ServiceConfig::default()
+        };
+        let tracker = RecordingTracker::new();
+        let transitions = tracker.transitions.clone();
+        let workspace_mgr = WorkspaceManager::new(tmp.path().to_path_buf());
+        let orchestrator = Orchestrator::new(
+            config,
+            Arc::new(tracker),
+            workspace_mgr,
+            tmp.path().join("WORKFLOW.md"),
+            None,
+        );
+
+        orchestrator.dispatch_issue(sample_issue(), None).await;
+
+        for _ in 0..20 {
+            if transitions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, state)| state == "In Review")
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("expected completion state transition to In Review");
     }
 }

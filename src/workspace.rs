@@ -22,6 +22,8 @@ pub enum WorkspaceError {
     BeforeRemoveHook(String),
     #[error("hook timed out after {0}ms")]
     HookTimeout(u64),
+    #[error("hook failed: {0}")]
+    HookFailed(String),
     #[error("workspace path is not a directory: {0}")]
     NotADirectory(PathBuf),
 }
@@ -181,7 +183,7 @@ impl WorkspaceManager {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| WorkspaceError::AfterCreateHook(e.to_string()))?;
+            .map_err(|e| WorkspaceError::HookFailed(e.to_string()))?;
 
         let result =
             tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await;
@@ -193,11 +195,11 @@ impl WorkspaceManager {
                         .chars()
                         .take(500)
                         .collect();
-                    return Err(WorkspaceError::AfterCreateHook(stderr));
+                    return Err(WorkspaceError::HookFailed(stderr));
                 }
                 Ok(())
             }
-            Ok(Err(e)) => Err(WorkspaceError::AfterCreateHook(e.to_string())),
+            Ok(Err(e)) => Err(WorkspaceError::HookFailed(e.to_string())),
             Err(_elapsed) => Err(WorkspaceError::HookTimeout(timeout_ms)),
         }
     }

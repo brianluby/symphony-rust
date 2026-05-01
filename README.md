@@ -93,6 +93,23 @@ Key config sections:
 
 Environment variable indirection is supported: use `$VAR_NAME` in config values.
 
+### Codex runtime policy
+
+The `codex` section controls the app-server process and the runtime policy
+Symphony sends when starting Codex threads and turns:
+
+| Key | Default | Allowed values |
+|-----|---------|----------------|
+| `command` | `codex app-server` | Shell command |
+| `approval_policy` | `never` | `never`, `on-request`, `on-failure`, `unless-trusted` |
+| `thread_sandbox` | `workspace-write` | `read-only`, `workspace-write`, `danger-full-access` |
+| `turn_sandbox_policy` | `workspace-write` | `read-only`, `workspace-write`, `danger-full-access` |
+
+`thread_sandbox` is sent to Codex `thread/start` as the legacy `sandbox`
+value. `turn_sandbox_policy` is sent to `turn/start` as `sandboxPolicy`; the
+default `workspace-write` payload preserves Symphony's existing behavior by
+enabling network access for the turn sandbox.
+
 ## Project Structure
 
 ```
