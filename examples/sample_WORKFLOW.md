@@ -34,6 +34,9 @@ agent:
 
 codex:
   command: codex app-server
+  approval_policy: never
+  thread_sandbox: workspace-write
+  turn_sandbox_policy: workspace-write
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
 ---

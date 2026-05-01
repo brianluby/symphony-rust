@@ -2,6 +2,13 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+pub const DEFAULT_CODEX_APPROVAL_POLICY: &str = "never";
+pub const DEFAULT_CODEX_THREAD_SANDBOX: &str = "workspace-write";
+pub const DEFAULT_CODEX_TURN_SANDBOX_POLICY: &str = "workspace-write";
+
+const CODEX_APPROVAL_POLICY_VALUES: &str = "never, on-request, on-failure, unless-trusted";
+const CODEX_SANDBOX_VALUES: &str = "read-only, workspace-write, danger-full-access";
+
 // ── Typed Service Config (§6.4) ─────────────────────────────────────────────
 
 /// Typed runtime values derived from `WORKFLOW.md` front matter with defaults
@@ -81,9 +88,9 @@ impl Default for ServiceConfig {
             agent_max_retry_backoff_ms: 300_000,
             agent_max_concurrent_agents_by_state: HashMap::new(),
             codex_command: "codex app-server".into(),
-            codex_approval_policy: None,
-            codex_thread_sandbox: None,
-            codex_turn_sandbox_policy: None,
+            codex_approval_policy: Some(DEFAULT_CODEX_APPROVAL_POLICY.into()),
+            codex_thread_sandbox: Some(DEFAULT_CODEX_THREAD_SANDBOX.into()),
+            codex_turn_sandbox_policy: Some(DEFAULT_CODEX_TURN_SANDBOX_POLICY.into()),
             codex_turn_timeout_ms: 3_600_000,
             codex_read_timeout_ms: 5_000,
             codex_stall_timeout_ms: 300_000u64,
@@ -238,9 +245,45 @@ impl ServiceConfig {
             if let Some(command) = codex.command {
                 sc.codex_command = command;
             }
-            sc.codex_approval_policy = codex.approval_policy;
-            sc.codex_thread_sandbox = codex.thread_sandbox;
-            sc.codex_turn_sandbox_policy = codex.turn_sandbox_policy;
+            if let Some(approval_policy) = codex.approval_policy {
+                sc.codex_approval_policy = Some(
+                    normalize_codex_approval_policy(&approval_policy)
+                        .ok_or_else(|| {
+                            invalid_value(
+                                "codex.approval_policy",
+                                approval_policy,
+                                CODEX_APPROVAL_POLICY_VALUES,
+                            )
+                        })?
+                        .into(),
+                );
+            }
+            if let Some(thread_sandbox) = codex.thread_sandbox {
+                sc.codex_thread_sandbox = Some(
+                    normalize_codex_sandbox(&thread_sandbox)
+                        .ok_or_else(|| {
+                            invalid_value(
+                                "codex.thread_sandbox",
+                                thread_sandbox,
+                                CODEX_SANDBOX_VALUES,
+                            )
+                        })?
+                        .into(),
+                );
+            }
+            if let Some(turn_sandbox_policy) = codex.turn_sandbox_policy {
+                sc.codex_turn_sandbox_policy = Some(
+                    normalize_codex_sandbox(&turn_sandbox_policy)
+                        .ok_or_else(|| {
+                            invalid_value(
+                                "codex.turn_sandbox_policy",
+                                turn_sandbox_policy,
+                                CODEX_SANDBOX_VALUES,
+                            )
+                        })?
+                        .into(),
+                );
+            }
             if let Some(turn_timeout_ms) = codex.turn_timeout_ms {
                 sc.codex_turn_timeout_ms = turn_timeout_ms;
             }
@@ -258,6 +301,8 @@ impl ServiceConfig {
     /// Validate dispatch-critical config. Returns `Ok(())` if the orchestrator
     /// can safely dispatch work.
     pub fn validate_dispatch(&self) -> Result<(), ConfigError> {
+        self.validate_codex_runtime_policy()?;
+
         // Mock mode skips credential and project slug checks
         if self.mock_mode {
             if self.codex_command.is_empty() {
@@ -287,6 +332,28 @@ impl ServiceConfig {
         }
         Ok(())
     }
+
+    fn validate_codex_runtime_policy(&self) -> Result<(), ConfigError> {
+        validate_optional_value(
+            "codex.approval_policy",
+            self.codex_approval_policy.as_deref(),
+            CODEX_APPROVAL_POLICY_VALUES,
+            normalize_codex_approval_policy,
+        )?;
+        validate_optional_value(
+            "codex.thread_sandbox",
+            self.codex_thread_sandbox.as_deref(),
+            CODEX_SANDBOX_VALUES,
+            normalize_codex_sandbox,
+        )?;
+        validate_optional_value(
+            "codex.turn_sandbox_policy",
+            self.codex_turn_sandbox_policy.as_deref(),
+            CODEX_SANDBOX_VALUES,
+            normalize_codex_sandbox,
+        )?;
+        Ok(())
+    }
 }
 
 // ── Config Errors ───────────────────────────────────────────────────────────
@@ -311,6 +378,12 @@ pub enum ConfigError {
     TemplateRenderError(String),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    #[error("invalid value for {field}: {value}; allowed values: {allowed}")]
+    InvalidValue {
+        field: String,
+        value: String,
+        allowed: &'static str,
+    },
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -381,6 +454,51 @@ pub fn expand_path(raw: &str, workflow_dir: &std::path::Path) -> String {
     }
 }
 
+pub fn normalize_codex_approval_policy(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "never" => Some("never"),
+        "on-request" | "on_request" | "onRequest" => Some("on-request"),
+        "on-failure" | "on_failure" | "onFailure" => Some("on-failure"),
+        "unless-trusted" | "unless_trusted" | "unlessTrusted" | "untrusted" => {
+            Some("unless-trusted")
+        }
+        _ => None,
+    }
+}
+
+pub fn normalize_codex_sandbox(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "read-only" | "read_only" | "readOnly" | "readonly" => Some("read-only"),
+        "workspace-write" | "workspace_write" | "workspaceWrite" => Some("workspace-write"),
+        "danger-full-access" | "danger_full_access" | "dangerFullAccess" => {
+            Some("danger-full-access")
+        }
+        _ => None,
+    }
+}
+
+fn validate_optional_value(
+    field: &str,
+    value: Option<&str>,
+    allowed: &'static str,
+    normalize: fn(&str) -> Option<&'static str>,
+) -> Result<(), ConfigError> {
+    if let Some(value) = value
+        && normalize(value).is_none()
+    {
+        return Err(invalid_value(field, value, allowed));
+    }
+    Ok(())
+}
+
+fn invalid_value(field: &str, value: impl Into<String>, allowed: &'static str) -> ConfigError {
+    ConfigError::InvalidValue {
+        field: field.into(),
+        value: value.into(),
+        allowed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +512,12 @@ mod tests {
         assert_eq!(cfg.agent_max_turns, 20);
         assert_eq!(cfg.hooks_timeout_ms, 60_000);
         assert_eq!(cfg.codex_stall_timeout_ms, 300_000);
+        assert_eq!(cfg.codex_approval_policy.as_deref(), Some("never"));
+        assert_eq!(cfg.codex_thread_sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            cfg.codex_turn_sandbox_policy.as_deref(),
+            Some("workspace-write")
+        );
     }
 
     #[test]
@@ -462,6 +586,43 @@ tracker:
 
         let err = ServiceConfig::from_yaml(&yaml, std::path::Path::new(".")).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn test_config_normalizes_codex_runtime_policy() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+codex:
+  approval_policy: onRequest
+  thread_sandbox: dangerFullAccess
+  turn_sandbox_policy: readOnly
+"#,
+        )
+        .unwrap();
+
+        let cfg = ServiceConfig::from_yaml(&yaml, std::path::Path::new(".")).unwrap();
+        assert_eq!(cfg.codex_approval_policy.as_deref(), Some("on-request"));
+        assert_eq!(
+            cfg.codex_thread_sandbox.as_deref(),
+            Some("danger-full-access")
+        );
+        assert_eq!(cfg.codex_turn_sandbox_policy.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn test_config_rejects_invalid_codex_runtime_policy() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+codex:
+  approval_policy: always
+"#,
+        )
+        .unwrap();
+
+        let err = ServiceConfig::from_yaml(&yaml, std::path::Path::new(".")).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "codex.approval_policy")
+        );
     }
 
     #[test]
