@@ -396,6 +396,17 @@ impl ServiceConfig {
             )));
         }
 
+        if let Some(completion_state) = self.tracker_completion_state.as_deref()
+            && self
+                .tracker_active_states
+                .iter()
+                .any(|state| state.eq_ignore_ascii_case(completion_state))
+        {
+            return Err(ConfigError::InvalidConfig(format!(
+                "tracker.completion_state must not be listed in tracker.active_states: {completion_state}"
+            )));
+        }
+
         Ok(())
     }
 }
@@ -791,6 +802,22 @@ codex:
             cfg.validate_dispatch(),
             Err(ConfigError::InvalidConfig(message))
                 if message.contains("tracker.claim_state must be listed in tracker.active_states")
+        ));
+    }
+
+    #[test]
+    fn test_validate_dispatch_rejects_completion_state_inside_active_states() {
+        let cfg = ServiceConfig {
+            mock_mode: true,
+            tracker_active_states: vec!["Todo".into(), "In Review".into()],
+            tracker_completion_state: Some("In Review".into()),
+            ..ServiceConfig::default()
+        };
+
+        assert!(matches!(
+            cfg.validate_dispatch(),
+            Err(ConfigError::InvalidConfig(message))
+                if message.contains("tracker.completion_state must not be listed in tracker.active_states")
         ));
     }
 }

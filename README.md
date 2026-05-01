@@ -118,10 +118,11 @@ claimed work remains active during reconciliation.
 `completion_state` is optional. When set, Symphony treats a normal worker exit as
 a tracker handoff, stops after one agent turn, runs `after_run`, and then moves
 the issue to the configured state. Failed, cancelled, or stalled runs do not get
-the completion transition. This matches the spec handoff model: the agent still
-does the repository/PR work described by the prompt, while Symphony performs the
-tracker state transition that hands the issue to the next human or automation
-stage, for example `In Review`.
+the completion transition. The value must not appear in `tracker.active_states`,
+otherwise a completed issue would re-enter Symphony's dispatch pool. This matches
+the spec handoff model: the agent still does the repository/PR work described by
+the prompt, while Symphony performs the tracker state transition that hands the
+issue to the next human or automation stage, for example `In Review`.
 
 Older workflows may still use `agent.claim_state` and `agent.completion_state`;
 those keys are accepted as aliases, but `tracker.*` is the preferred schema.
