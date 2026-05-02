@@ -78,6 +78,8 @@ agent:
   max_concurrent_agents: 1
   max_turns: 20
   max_retry_backoff_ms: 300000
+  max_run_ms: 600000
+  max_tokens_per_run: 200000
   claim_state: In Progress
   completion_state: In Review
 

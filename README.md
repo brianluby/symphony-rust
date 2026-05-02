@@ -88,10 +88,24 @@ Key config sections:
 | `polling` | Poll interval in ms |
 | `workspace` | Root directory, path resolution |
 | `hooks` | Shell scripts for workspace lifecycle |
-| `agent` | Concurrency, max turns, retry backoff |
+| `agent` | Concurrency, max turns, retry backoff, worker safety budgets |
 | `codex` | Agent command, timeouts, stall detection |
 
 Environment variable indirection is supported: use `$VAR_NAME` in config values.
+
+### Agent safety budgets
+
+The `agent` section can set hard per-worker budgets to stop active runs that
+are still producing events but consuming too much time or too many tokens:
+
+| Key | Behavior |
+|-----|----------|
+| `max_run_ms` | Cancels the worker once wall-clock runtime reaches this many milliseconds |
+| `max_tokens_per_run` | Cancels the worker once cumulative Codex tokens for the worker reach this value |
+
+Budget cancellations are reported as worker errors and held in-process without
+an automatic retry, preventing repeated token burn. `/api/v1/state` reports
+cumulative tokens for active runs.
 
 ### Codex runtime policy
 

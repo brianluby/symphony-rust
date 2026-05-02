@@ -126,10 +126,16 @@ async fn api_state(State(state): State<HttpState>) -> Json<ApiStateResponse> {
             started_at: entry.started_at.to_rfc3339(),
             last_event_at: entry.session.last_codex_timestamp.map(|t| t.to_rfc3339()),
             tokens: TokenSummary {
-                input_tokens: entry.session.last_reported_input_tokens,
-                output_tokens: entry.session.last_reported_output_tokens,
-                total_tokens: entry.session.last_reported_input_tokens
-                    + entry.session.last_reported_output_tokens,
+                input_tokens: entry.session.codex_input_tokens,
+                output_tokens: entry.session.codex_output_tokens,
+                total_tokens: if entry.session.codex_total_tokens > 0 {
+                    entry.session.codex_total_tokens
+                } else {
+                    entry
+                        .session
+                        .codex_input_tokens
+                        .saturating_add(entry.session.codex_output_tokens)
+                },
             },
         })
         .collect();

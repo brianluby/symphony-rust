@@ -40,6 +40,8 @@ pub struct ServiceConfig {
     pub agent_max_concurrent_agents: u32,
     pub agent_max_turns: u32,
     pub agent_max_retry_backoff_ms: u64,
+    pub agent_max_run_ms: Option<u64>,
+    pub agent_max_tokens_per_run: Option<u64>,
     pub agent_max_concurrent_agents_by_state: HashMap<String, u32>,
     pub agent_claim_state: Option<String>,
     pub agent_completion_state: Option<String>,
@@ -88,6 +90,8 @@ impl Default for ServiceConfig {
             agent_max_concurrent_agents: 10,
             agent_max_turns: 20,
             agent_max_retry_backoff_ms: 300_000,
+            agent_max_run_ms: None,
+            agent_max_tokens_per_run: None,
             agent_max_concurrent_agents_by_state: HashMap::new(),
             agent_claim_state: None,
             agent_completion_state: None,
@@ -155,6 +159,8 @@ struct RawAgentConfig {
     max_concurrent_agents: Option<u32>,
     max_turns: Option<u32>,
     max_retry_backoff_ms: Option<u64>,
+    max_run_ms: Option<u64>,
+    max_tokens_per_run: Option<u64>,
     max_concurrent_agents_by_state: Option<HashMap<String, u32>>,
     claim_state: Option<String>,
     completion_state: Option<String>,
@@ -238,6 +244,8 @@ impl ServiceConfig {
             if let Some(max_retry_backoff_ms) = agent.max_retry_backoff_ms {
                 sc.agent_max_retry_backoff_ms = max_retry_backoff_ms;
             }
+            sc.agent_max_run_ms = agent.max_run_ms;
+            sc.agent_max_tokens_per_run = agent.max_tokens_per_run;
             if let Some(by_state) = agent.max_concurrent_agents_by_state {
                 sc.agent_max_concurrent_agents_by_state = by_state
                     .into_iter()
@@ -310,6 +318,7 @@ impl ServiceConfig {
     /// can safely dispatch work.
     pub fn validate_dispatch(&self) -> Result<(), ConfigError> {
         self.validate_codex_runtime_policy()?;
+        self.validate_agent_limits()?;
 
         // Mock mode skips credential and project slug checks
         if self.mock_mode {
@@ -360,6 +369,12 @@ impl ServiceConfig {
             CODEX_SANDBOX_VALUES,
             normalize_codex_sandbox,
         )?;
+        Ok(())
+    }
+
+    fn validate_agent_limits(&self) -> Result<(), ConfigError> {
+        validate_optional_positive("agent.max_run_ms", self.agent_max_run_ms)?;
+        validate_optional_positive("agent.max_tokens_per_run", self.agent_max_tokens_per_run)?;
         Ok(())
     }
 }
@@ -507,6 +522,15 @@ fn invalid_value(field: &str, value: impl Into<String>, allowed: &'static str) -
     }
 }
 
+fn validate_optional_positive(field: &str, value: Option<u64>) -> Result<(), ConfigError> {
+    if value == Some(0) {
+        return Err(ConfigError::InvalidConfig(format!(
+            "{field} must be greater than 0 when set"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +542,8 @@ mod tests {
         assert_eq!(cfg.poll_interval_ms, 30_000);
         assert_eq!(cfg.agent_max_concurrent_agents, 10);
         assert_eq!(cfg.agent_max_turns, 20);
+        assert_eq!(cfg.agent_max_run_ms, None);
+        assert_eq!(cfg.agent_max_tokens_per_run, None);
         assert_eq!(cfg.hooks_timeout_ms, 60_000);
         assert_eq!(cfg.codex_stall_timeout_ms, 300_000);
         assert_eq!(cfg.codex_approval_policy.as_deref(), Some("never"));
@@ -577,6 +603,25 @@ codex:
         let cfg = ServiceConfig::from_yaml(&yaml, std::path::Path::new(".")).unwrap();
         assert_eq!(cfg.tracker_api_key.unwrap(), "test-key");
         assert_eq!(cfg.tracker_project_slug.unwrap(), "my-project");
+    }
+
+    #[test]
+    fn test_config_from_yaml_agent_limits() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+agent:
+  max_run_ms: 600000
+  max_tokens_per_run: 200000
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = ServiceConfig::from_yaml(&yaml, std::path::Path::new(".")).unwrap();
+        cfg.mock_mode = true;
+
+        assert_eq!(cfg.agent_max_run_ms, Some(600_000));
+        assert_eq!(cfg.agent_max_tokens_per_run, Some(200_000));
+        assert!(cfg.validate_dispatch().is_ok());
     }
 
     #[test]
@@ -640,5 +685,20 @@ codex:
             ..ServiceConfig::default()
         };
         assert!(cfg.validate_dispatch().is_err());
+    }
+
+    #[test]
+    fn test_validate_dispatch_rejects_zero_agent_limits() {
+        let cfg = ServiceConfig {
+            mock_mode: true,
+            agent_max_tokens_per_run: Some(0),
+            ..ServiceConfig::default()
+        };
+
+        assert!(matches!(
+            cfg.validate_dispatch(),
+            Err(ConfigError::InvalidConfig(message))
+                if message.contains("agent.max_tokens_per_run")
+        ));
     }
 }

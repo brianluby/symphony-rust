@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -43,6 +43,8 @@ pub struct AgentRunnerConfig {
     pub read_timeout_ms: u64,
     pub stall_timeout_ms: u64,
     pub max_turns: u32,
+    pub max_run_ms: Option<u64>,
+    pub max_tokens_per_run: Option<u64>,
     pub stop_after_first_turn: bool,
     pub on_session_update: Option<Arc<dyn Fn(LiveSession) + Send + Sync>>,
     pub cancelled: CancelHandle,
@@ -62,6 +64,7 @@ pub async fn run_agent_attempt(
     prompt: String,
     continuation_template: impl Fn(u32, u32) -> String,
 ) -> AgentOutcome {
+    let attempt_started = Instant::now();
     let mut entry = RunningEntry {
         issue_id: issue.id.clone(),
         identifier: issue.identifier.clone(),
@@ -253,12 +256,31 @@ pub async fn run_agent_attempt(
             }
         }
 
-        // Read events from agent with stall detection
-        let read_result = if config.stall_timeout_ms > 0 {
+        // Read events from agent with stall and safety-budget detection.
+        let event_timeout_ms =
+            next_event_timeout_ms(config.stall_timeout_ms, attempt_started, config.max_run_ms);
+        if event_timeout_ms == Some(0) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return AgentOutcome::Error {
+                error: max_run_error(config.max_run_ms.unwrap_or_default()),
+                entry,
+            };
+        }
+
+        let read_result = if let Some(timeout_ms) = event_timeout_ms {
             tokio::select! {
                 result = timeout(
-                    Duration::from_millis(config.stall_timeout_ms),
-                    read_agent_events(&mut lines, &mut entry, config.on_session_update.as_deref()),
+                    Duration::from_millis(timeout_ms),
+                    read_agent_events(
+                        &mut lines,
+                        &mut entry,
+                        config.on_session_update.as_deref(),
+                        attempt_started,
+                        config.max_run_ms,
+                        config.max_tokens_per_run,
+                    ),
                 ) => result,
                 () = wait_for_cancel(config.cancelled.clone()) => {
                     let _ = child.kill().await;
@@ -272,7 +294,14 @@ pub async fn run_agent_attempt(
             }
         } else {
             tokio::select! {
-                result = read_agent_events(&mut lines, &mut entry, config.on_session_update.as_deref()) => Ok(result),
+                result = read_agent_events(
+                    &mut lines,
+                    &mut entry,
+                    config.on_session_update.as_deref(),
+                    attempt_started,
+                    config.max_run_ms,
+                    config.max_tokens_per_run,
+                ) => Ok(result),
                 () = wait_for_cancel(config.cancelled.clone()) => {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -323,16 +352,31 @@ pub async fn run_agent_attempt(
                     entry,
                 };
             }
-            Err(_elapsed) => {
-                // Stall timeout
+            Ok(Err(EventError::RunLimitExceeded(reason))) => {
                 let _ = child.kill().await;
+                let _ = child.wait().await;
+                stderr_task.abort();
                 return AgentOutcome::Error {
-                    error: format!(
-                        "agent stalled (no events for {}ms)",
-                        config.stall_timeout_ms
-                    ),
+                    error: reason,
                     entry,
                 };
+            }
+            Err(_elapsed) => {
+                // Stall or max-run timeout
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                stderr_task.abort();
+                let error = if let Some(max_run_ms) = config.max_run_ms
+                    && attempt_started.elapsed() >= Duration::from_millis(max_run_ms)
+                {
+                    max_run_error(max_run_ms)
+                } else {
+                    format!(
+                        "agent stalled (no events for {}ms)",
+                        config.stall_timeout_ms
+                    )
+                };
+                return AgentOutcome::Error { error, entry };
             }
         }
     }
@@ -466,6 +510,7 @@ async fn launch_agent(command: &str, workspace: &Path) -> Result<Child, std::io:
 enum EventError {
     Exit,
     TurnFailed(String),
+    RunLimitExceeded(String),
 }
 
 async fn read_initialize_response(
@@ -555,6 +600,9 @@ async fn read_agent_events(
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     entry: &mut RunningEntry,
     on_session_update: Option<&(dyn Fn(LiveSession) + Send + Sync)>,
+    attempt_started: Instant,
+    max_run_ms: Option<u64>,
+    max_tokens_per_run: Option<u64>,
 ) -> Result<(), EventError> {
     loop {
         let line = match lines.next_line().await {
@@ -643,6 +691,12 @@ async fn read_agent_events(
 
         publish_session_update(entry, on_session_update);
 
+        if let Some(reason) =
+            run_limit_violation(entry, attempt_started, max_run_ms, max_tokens_per_run)
+        {
+            return Err(EventError::RunLimitExceeded(reason));
+        }
+
         match event_type {
             Some("v2/TurnCompleted") | Some("turn_completed") | Some("turn/completed") => {
                 tracing::info!(session = ?entry.session.session_id, "turn completed event");
@@ -673,6 +727,66 @@ async fn read_agent_events(
             }
         }
     }
+}
+
+fn next_event_timeout_ms(
+    stall_timeout_ms: u64,
+    attempt_started: Instant,
+    max_run_ms: Option<u64>,
+) -> Option<u64> {
+    let stall_timeout = (stall_timeout_ms > 0).then_some(stall_timeout_ms);
+    let run_timeout = max_run_ms.map(|max_run_ms| {
+        let elapsed_ms = attempt_started.elapsed().as_millis();
+        let elapsed_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+        max_run_ms.saturating_sub(elapsed_ms)
+    });
+
+    match (stall_timeout, run_timeout) {
+        (Some(stall), Some(run)) => Some(stall.min(run)),
+        (Some(stall), None) => Some(stall),
+        (None, Some(run)) => Some(run),
+        (None, None) => None,
+    }
+}
+
+fn run_limit_violation(
+    entry: &RunningEntry,
+    attempt_started: Instant,
+    max_run_ms: Option<u64>,
+    max_tokens_per_run: Option<u64>,
+) -> Option<String> {
+    if let Some(max_run_ms) = max_run_ms
+        && attempt_started.elapsed() >= Duration::from_millis(max_run_ms)
+    {
+        return Some(max_run_error(max_run_ms));
+    }
+
+    if let Some(max_tokens) = max_tokens_per_run {
+        let current_tokens = current_session_tokens(&entry.session);
+        if current_tokens >= max_tokens {
+            return Some(max_tokens_error(max_tokens, current_tokens));
+        }
+    }
+
+    None
+}
+
+fn current_session_tokens(session: &LiveSession) -> u64 {
+    if session.codex_total_tokens > 0 {
+        session.codex_total_tokens
+    } else {
+        session
+            .codex_input_tokens
+            .saturating_add(session.codex_output_tokens)
+    }
+}
+
+fn max_run_error(max_run_ms: u64) -> String {
+    format!("worker exceeded max_run_ms budget ({max_run_ms}ms)")
+}
+
+fn max_tokens_error(max_tokens: u64, current_tokens: u64) -> String {
+    format!("worker exceeded max_tokens_per_run budget ({current_tokens}/{max_tokens} tokens)")
 }
 
 fn json_rpc_error_message(msg: &serde_json::Value) -> Option<String> {
@@ -775,10 +889,33 @@ mod tests {
             read_timeout_ms: 1,
             stall_timeout_ms: 1,
             max_turns: 1,
+            max_run_ms: None,
+            max_tokens_per_run: None,
             stop_after_first_turn: false,
             on_session_update: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn test_issue() -> Issue {
+        Issue {
+            id: "issue-1".into(),
+            identifier: "T-1".into(),
+            title: "Test issue".into(),
+            description: None,
+            priority: None,
+            state: "In Progress".into(),
+            branch_name: None,
+            url: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
     }
 
     #[test]
@@ -832,5 +969,87 @@ mod tests {
                 "excludeSlashTmp": false,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn run_agent_attempt_errors_when_token_budget_is_exceeded() {
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join("fake_app_server.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+
+IFS= read -r _line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-test"}}'
+
+IFS= read -r _line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-real"}}}'
+
+IFS= read -r _line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-real"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-real","turnId":"turn-real","tokenUsage":{"total":{"totalTokens":150,"inputTokens":100,"outputTokens":50},"last":{"totalTokens":150,"inputTokens":100,"outputTokens":50}}}}'
+sleep 5
+"#,
+        )
+        .unwrap();
+
+        let mut config = test_config();
+        config.command = format!("bash {}", shell_quote(&script_path));
+        config.workspace_path = temp.path().to_path_buf();
+        config.stall_timeout_ms = 5_000;
+        config.max_tokens_per_run = Some(100);
+
+        let outcome = run_agent_attempt(config, test_issue(), None, "do work".into(), |_, _| {
+            "continue".into()
+        })
+        .await;
+
+        match outcome {
+            AgentOutcome::Error { error, entry } => {
+                assert!(error.contains("max_tokens_per_run"));
+                assert_eq!(entry.session.codex_total_tokens, 150);
+            }
+            other => panic!("expected token budget error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_attempt_errors_when_wall_clock_budget_is_exceeded() {
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join("fake_app_server.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+
+IFS= read -r _line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-test"}}'
+
+IFS= read -r _line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-real"}}}'
+
+IFS= read -r _line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-real"}}}'
+sleep 5
+"#,
+        )
+        .unwrap();
+
+        let mut config = test_config();
+        config.command = format!("bash {}", shell_quote(&script_path));
+        config.workspace_path = temp.path().to_path_buf();
+        config.stall_timeout_ms = 5_000;
+        config.max_run_ms = Some(50);
+
+        let outcome = run_agent_attempt(config, test_issue(), None, "do work".into(), |_, _| {
+            "continue".into()
+        })
+        .await;
+
+        match outcome {
+            AgentOutcome::Error { error, .. } => assert!(error.contains("max_run_ms")),
+            other => panic!("expected wall-clock budget error, got {other:?}"),
+        }
     }
 }
