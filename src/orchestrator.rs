@@ -34,10 +34,12 @@ pub enum WorkerOutcome {
         tokens_out: u64,
         elapsed_seconds: f64,
     },
-    /// Worker failed — schedule backoff retry.
+    /// Worker failed. Retryable failures schedule backoff; non-retryable
+    /// failures are held in-process to prevent repeated budget burn.
     Error {
         error: String,
         retry_attempt: Option<u32>,
+        retryable: bool,
         tokens_in: u64,
         tokens_out: u64,
         elapsed_seconds: f64,
@@ -391,7 +393,7 @@ impl Orchestrator {
             let mock_mode = config.mock_agent;
             let completion_state = config.tracker_completion_state.clone();
             let tracker_for_completion = tracker.clone();
-            let outcome = run_worker(WorkerContext {
+            let mut outcome = run_worker(WorkerContext {
                 config,
                 issue_id: issue_id.clone(),
                 identifier: identifier.clone(),
@@ -418,7 +420,12 @@ impl Orchestrator {
                 return;
             }
 
-            if let WorkerOutcome::Normal { .. } = &outcome
+            if let WorkerOutcome::Normal {
+                tokens_in,
+                tokens_out,
+                elapsed_seconds,
+                ..
+            } = outcome.clone()
                 && let Some(state_name) = completion_state.as_deref()
             {
                 match tracker_for_completion
@@ -431,13 +438,23 @@ impl Orchestrator {
                         state = %state_name,
                         "issue transitioned after successful worker run"
                     ),
-                    Err(e) => tracing::error!(
-                        issue_id = %issue_id,
-                        identifier = %identifier,
-                        state = %state_name,
-                        error = %e,
-                        "failed to transition issue after successful worker run"
-                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            issue_id = %issue_id,
+                            identifier = %identifier,
+                            state = %state_name,
+                            error = %e,
+                            "failed to transition issue after successful worker run"
+                        );
+                        outcome = WorkerOutcome::Error {
+                            error: format!("completion transition: {e}"),
+                            retry_attempt: attempt,
+                            retryable: false,
+                            tokens_in,
+                            tokens_out,
+                            elapsed_seconds,
+                        };
+                    }
                 }
             }
 
@@ -480,6 +497,7 @@ impl Orchestrator {
                 WorkerOutcome::Error {
                     error,
                     retry_attempt,
+                    retryable,
                     tokens_in,
                     tokens_out,
                     elapsed_seconds,
@@ -490,28 +508,38 @@ impl Orchestrator {
                     state.codex_totals.total_tokens += tokens_in + tokens_out;
                     state.codex_totals.seconds_running += elapsed_seconds;
 
-                    let next = retry_attempt.unwrap_or(0) + 1;
-                    let backoff_ms = compute_backoff(next, max_retry_backoff_ms);
+                    if retryable {
+                        let next = retry_attempt.unwrap_or(0) + 1;
+                        let backoff_ms = compute_backoff(next, max_retry_backoff_ms);
 
-                    state.retry_attempts.insert(
-                        issue_id.clone(),
-                        RetryEntry {
-                            issue_id: issue_id.clone(),
-                            identifier: identifier.clone(),
-                            attempt: next,
-                            due_at_ms: backoff_ms,
-                            error: Some(error.clone()),
-                        },
-                    );
+                        state.retry_attempts.insert(
+                            issue_id.clone(),
+                            RetryEntry {
+                                issue_id: issue_id.clone(),
+                                identifier: identifier.clone(),
+                                attempt: next,
+                                due_at_ms: backoff_ms,
+                                error: Some(error.clone()),
+                            },
+                        );
 
-                    tracing::debug!(
-                        issue_id = %issue_id,
-                        identifier = %identifier,
-                        attempt = next,
-                        backoff_ms = backoff_ms,
-                        error = %error,
-                        "worker failed, retry scheduled"
-                    );
+                        tracing::debug!(
+                            issue_id = %issue_id,
+                            identifier = %identifier,
+                            attempt = next,
+                            backoff_ms = backoff_ms,
+                            error = %error,
+                            "worker failed, retry scheduled"
+                        );
+                    } else {
+                        state.completed.insert(issue_id.clone());
+                        tracing::warn!(
+                            issue_id = %issue_id,
+                            identifier = %identifier,
+                            error = %error,
+                            "worker stopped by non-retryable safety budget"
+                        );
+                    }
                 }
             }
         });
@@ -790,7 +818,7 @@ impl Orchestrator {
                         let mock_mode = cfg.mock_agent;
                         let completion_state = cfg.tracker_completion_state.clone();
                         let tracker_for_completion = tracker_clone.clone();
-                        let outcome = run_worker(WorkerContext {
+                        let mut outcome = run_worker(WorkerContext {
                             config: cfg,
                             issue_id: id.clone(),
                             identifier: ident.clone(),
@@ -816,7 +844,12 @@ impl Orchestrator {
                             return;
                         }
 
-                        if let WorkerOutcome::Normal { .. } = &outcome
+                        if let WorkerOutcome::Normal {
+                            tokens_in,
+                            tokens_out,
+                            elapsed_seconds,
+                            ..
+                        } = outcome.clone()
                             && let Some(state_name) = completion_state.as_deref()
                         {
                             match tracker_for_completion
@@ -829,13 +862,23 @@ impl Orchestrator {
                                     state = %state_name,
                                     "issue transitioned after successful retry worker run"
                                 ),
-                                Err(e) => tracing::error!(
-                                    issue_id = %id,
-                                    identifier = %ident,
-                                    state = %state_name,
-                                    error = %e,
-                                    "failed to transition issue after successful retry worker run"
-                                ),
+                                Err(e) => {
+                                    tracing::error!(
+                                        issue_id = %id,
+                                        identifier = %ident,
+                                        state = %state_name,
+                                        error = %e,
+                                        "failed to transition issue after successful retry worker run"
+                                    );
+                                    outcome = WorkerOutcome::Error {
+                                        error: format!("completion transition: {e}"),
+                                        retry_attempt: Some(retry.attempt),
+                                        retryable: false,
+                                        tokens_in,
+                                        tokens_out,
+                                        elapsed_seconds,
+                                    };
+                                }
                             }
                         }
 
@@ -869,6 +912,7 @@ impl Orchestrator {
                             WorkerOutcome::Error {
                                 error,
                                 retry_attempt,
+                                retryable,
                                 tokens_in,
                                 tokens_out,
                                 elapsed_seconds,
@@ -878,17 +922,27 @@ impl Orchestrator {
                                 s.codex_totals.output_tokens += tokens_out;
                                 s.codex_totals.total_tokens += tokens_in + tokens_out;
                                 s.codex_totals.seconds_running += elapsed_seconds;
-                                let next = retry_attempt.unwrap_or(retry.attempt) + 1;
-                                s.retry_attempts.insert(
-                                    id.clone(),
-                                    RetryEntry {
-                                        issue_id: id.clone(),
-                                        identifier: ident.clone(),
-                                        attempt: next,
-                                        due_at_ms: compute_backoff(next, max_retry_backoff_ms),
-                                        error: Some(error),
-                                    },
-                                );
+                                if retryable {
+                                    let next = retry_attempt.unwrap_or(retry.attempt) + 1;
+                                    s.retry_attempts.insert(
+                                        id.clone(),
+                                        RetryEntry {
+                                            issue_id: id.clone(),
+                                            identifier: ident.clone(),
+                                            attempt: next,
+                                            due_at_ms: compute_backoff(next, max_retry_backoff_ms),
+                                            error: Some(error),
+                                        },
+                                    );
+                                } else {
+                                    s.completed.insert(id.clone());
+                                    tracing::warn!(
+                                        issue_id = %id,
+                                        identifier = %ident,
+                                        error = %error,
+                                        "retry worker stopped by non-retryable safety budget"
+                                    );
+                                }
                             }
                         }
                     });
@@ -1157,6 +1211,7 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
             return WorkerOutcome::Error {
                 error: "cancelled by reconciliation".into(),
                 retry_attempt: ctx.attempt,
+                retryable: true,
                 tokens_in: 0,
                 tokens_out: 0,
                 elapsed_seconds: start.elapsed().as_secs_f64(),
@@ -1199,6 +1254,8 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
         read_timeout_ms: ctx.config.codex_read_timeout_ms,
         stall_timeout_ms: ctx.config.codex_stall_timeout_ms,
         max_turns,
+        max_run_ms: None,
+        max_tokens_per_run: None,
         stop_after_first_turn: ctx.config.tracker_completion_state.is_some(),
         on_session_update: Some(Arc::new(move |session| {
             if let Ok(mut state) = running_state.try_write()
@@ -1215,6 +1272,19 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
             return WorkerOutcome::Error {
                 error: "cancelled by reconciliation".into(),
                 retry_attempt: ctx.attempt,
+                retryable: true,
+                tokens_in: total_tokens_in,
+                tokens_out: total_tokens_out,
+                elapsed_seconds: start.elapsed().as_secs_f64(),
+            };
+        }
+
+        let used_tokens = total_tokens_in.saturating_add(total_tokens_out);
+        if let Some(error) = worker_budget_error(&ctx.config, start.elapsed(), used_tokens) {
+            return WorkerOutcome::Error {
+                error,
+                retry_attempt: ctx.attempt,
+                retryable: false,
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
                 elapsed_seconds: start.elapsed().as_secs_f64(),
@@ -1248,8 +1318,15 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
             updated_at: None,
         };
 
+        let remaining_run_ms = remaining_run_ms(ctx.config.agent_max_run_ms, start.elapsed());
+        let remaining_tokens =
+            remaining_token_budget(ctx.config.agent_max_tokens_per_run, used_tokens);
         let outcome = crate::agent_runner::run_agent_attempt(
-            agent_cfg.clone(),
+            crate::agent_runner::AgentRunnerConfig {
+                max_run_ms: remaining_run_ms,
+                max_tokens_per_run: remaining_tokens,
+                ..agent_cfg.clone()
+            },
             issue.clone(),
             if turn_number == 1 { ctx.attempt } else { None },
             turn_prompt,
@@ -1303,6 +1380,7 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
                 total_tokens_in += entry.session.codex_input_tokens;
                 total_tokens_out += entry.session.codex_output_tokens;
                 return WorkerOutcome::Error {
+                    retryable: !is_worker_budget_error(&error),
                     error,
                     retry_attempt: ctx.attempt,
                     tokens_in: total_tokens_in,
@@ -1316,6 +1394,7 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
                 return WorkerOutcome::Error {
                     error: reason,
                     retry_attempt: ctx.attempt,
+                    retryable: true,
                     tokens_in: total_tokens_in,
                     tokens_out: total_tokens_out,
                     elapsed_seconds: start.elapsed().as_secs_f64(),
@@ -1323,6 +1402,45 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
             }
         }
     }
+}
+
+fn worker_budget_error(
+    config: &ServiceConfig,
+    elapsed: Duration,
+    used_tokens: u64,
+) -> Option<String> {
+    if let Some(max_run_ms) = config.agent_max_run_ms
+        && elapsed >= Duration::from_millis(max_run_ms)
+    {
+        return Some(format!(
+            "worker exceeded max_run_ms budget ({max_run_ms}ms)"
+        ));
+    }
+
+    if let Some(max_tokens) = config.agent_max_tokens_per_run
+        && used_tokens >= max_tokens
+    {
+        return Some(format!(
+            "worker exceeded max_tokens_per_run budget ({used_tokens}/{max_tokens} tokens)"
+        ));
+    }
+
+    None
+}
+
+fn is_worker_budget_error(error: &str) -> bool {
+    error.contains("max_run_ms") || error.contains("max_tokens_per_run")
+}
+
+fn remaining_run_ms(max_run_ms: Option<u64>, elapsed: Duration) -> Option<u64> {
+    max_run_ms.map(|max_run_ms| {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        max_run_ms.saturating_sub(elapsed_ms)
+    })
+}
+
+fn remaining_token_budget(max_tokens: Option<u64>, used_tokens: u64) -> Option<u64> {
+    max_tokens.map(|max_tokens| max_tokens.saturating_sub(used_tokens))
 }
 
 /// Compute exponential backoff in milliseconds.
@@ -1448,6 +1566,27 @@ mod tests {
         assert_eq!(compute_backoff(3, 300_000), 40_000);
         assert_eq!(compute_backoff(5, 300_000), 160_000);
         assert_eq!(compute_backoff(10, 300_000), 300_000);
+    }
+
+    #[test]
+    fn test_worker_budget_error_detects_limits() {
+        let config = ServiceConfig {
+            agent_max_run_ms: Some(1_000),
+            agent_max_tokens_per_run: Some(2_000),
+            ..ServiceConfig::default()
+        };
+
+        assert!(
+            worker_budget_error(&config, std::time::Duration::from_millis(1_001), 0)
+                .unwrap()
+                .contains("max_run_ms")
+        );
+        assert!(
+            worker_budget_error(&config, std::time::Duration::from_millis(10), 2_000)
+                .unwrap()
+                .contains("max_tokens_per_run")
+        );
+        assert!(worker_budget_error(&config, std::time::Duration::from_millis(10), 10).is_none());
     }
 
     #[tokio::test]
