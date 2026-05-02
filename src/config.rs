@@ -565,7 +565,9 @@ fn validate_optional_non_empty(field: &str, value: Option<&str>) -> Result<(), C
     if let Some(value) = value
         && value.trim().is_empty()
     {
-        return Err(ConfigError::MissingField(field.into()));
+        return Err(ConfigError::InvalidConfig(format!(
+            "{field} must not be empty"
+        )));
     }
     Ok(())
 }
@@ -846,7 +848,7 @@ codex:
         };
 
         assert!(
-            matches!(cfg.validate_dispatch(), Err(ConfigError::MissingField(field)) if field == "tracker.completion_state")
+            matches!(cfg.validate_dispatch(), Err(ConfigError::InvalidConfig(message)) if message == "tracker.completion_state must not be empty")
         );
     }
 
