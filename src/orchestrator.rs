@@ -257,7 +257,7 @@ impl Orchestrator {
         };
 
         let config_snapshot = self.config.read().await.clone();
-        if let Some(claim_state) = config_snapshot.agent_claim_state.as_deref()
+        if let Some(claim_state) = config_snapshot.tracker_claim_state.as_deref()
             && !issue.state.eq_ignore_ascii_case(claim_state)
         {
             match self
@@ -391,9 +391,9 @@ impl Orchestrator {
             let _permit = permit;
             let max_retry_backoff_ms = config.agent_max_retry_backoff_ms;
             let mock_mode = config.mock_agent;
-            let completion_state = config.agent_completion_state.clone();
+            let completion_state = config.tracker_completion_state.clone();
             let tracker_for_completion = tracker.clone();
-            let outcome = run_worker(WorkerContext {
+            let mut outcome = run_worker(WorkerContext {
                 config,
                 issue_id: issue_id.clone(),
                 identifier: identifier.clone(),
@@ -420,7 +420,12 @@ impl Orchestrator {
                 return;
             }
 
-            if let WorkerOutcome::Normal { .. } = &outcome
+            if let WorkerOutcome::Normal {
+                tokens_in,
+                tokens_out,
+                elapsed_seconds,
+                ..
+            } = outcome.clone()
                 && let Some(state_name) = completion_state.as_deref()
             {
                 match tracker_for_completion
@@ -433,13 +438,23 @@ impl Orchestrator {
                         state = %state_name,
                         "issue transitioned after successful worker run"
                     ),
-                    Err(e) => tracing::error!(
-                        issue_id = %issue_id,
-                        identifier = %identifier,
-                        state = %state_name,
-                        error = %e,
-                        "failed to transition issue after successful worker run"
-                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            issue_id = %issue_id,
+                            identifier = %identifier,
+                            state = %state_name,
+                            error = %e,
+                            "failed to transition issue after successful worker run"
+                        );
+                        outcome = WorkerOutcome::Error {
+                            error: format!("completion transition: {e}"),
+                            retry_attempt: attempt,
+                            retryable: false,
+                            tokens_in,
+                            tokens_out,
+                            elapsed_seconds,
+                        };
+                    }
                 }
             }
 
@@ -680,7 +695,7 @@ impl Orchestrator {
 
                     // Dispatch via the same worker path
                     let cfg_snapshot = config.read().await.clone();
-                    if let Some(claim_state) = cfg_snapshot.agent_claim_state.as_deref()
+                    if let Some(claim_state) = cfg_snapshot.tracker_claim_state.as_deref()
                         && !issue.state.eq_ignore_ascii_case(claim_state)
                     {
                         match tracker.transition_issue_state(&issue_id, claim_state).await {
@@ -801,9 +816,9 @@ impl Orchestrator {
                         let _permit = permit;
                         let max_retry_backoff_ms = cfg.agent_max_retry_backoff_ms;
                         let mock_mode = cfg.mock_agent;
-                        let completion_state = cfg.agent_completion_state.clone();
+                        let completion_state = cfg.tracker_completion_state.clone();
                         let tracker_for_completion = tracker_clone.clone();
-                        let outcome = run_worker(WorkerContext {
+                        let mut outcome = run_worker(WorkerContext {
                             config: cfg,
                             issue_id: id.clone(),
                             identifier: ident.clone(),
@@ -829,7 +844,12 @@ impl Orchestrator {
                             return;
                         }
 
-                        if let WorkerOutcome::Normal { .. } = &outcome
+                        if let WorkerOutcome::Normal {
+                            tokens_in,
+                            tokens_out,
+                            elapsed_seconds,
+                            ..
+                        } = outcome.clone()
                             && let Some(state_name) = completion_state.as_deref()
                         {
                             match tracker_for_completion
@@ -842,13 +862,23 @@ impl Orchestrator {
                                     state = %state_name,
                                     "issue transitioned after successful retry worker run"
                                 ),
-                                Err(e) => tracing::error!(
-                                    issue_id = %id,
-                                    identifier = %ident,
-                                    state = %state_name,
-                                    error = %e,
-                                    "failed to transition issue after successful retry worker run"
-                                ),
+                                Err(e) => {
+                                    tracing::error!(
+                                        issue_id = %id,
+                                        identifier = %ident,
+                                        state = %state_name,
+                                        error = %e,
+                                        "failed to transition issue after successful retry worker run"
+                                    );
+                                    outcome = WorkerOutcome::Error {
+                                        error: format!("completion transition: {e}"),
+                                        retry_attempt: Some(retry.attempt),
+                                        retryable: false,
+                                        tokens_in,
+                                        tokens_out,
+                                        elapsed_seconds,
+                                    };
+                                }
                             }
                         }
 
@@ -1226,7 +1256,7 @@ async fn run_worker(ctx: WorkerContext) -> WorkerOutcome {
         max_turns,
         max_run_ms: None,
         max_tokens_per_run: None,
-        stop_after_first_turn: ctx.config.agent_completion_state.is_some(),
+        stop_after_first_turn: ctx.config.tracker_completion_state.is_some(),
         on_session_update: Some(Arc::new(move |session| {
             if let Ok(mut state) = running_state.try_write()
                 && let Some(entry) = state.running.get_mut(&running_issue_id)
@@ -1601,7 +1631,7 @@ mod tests {
             mock_agent: false,
             codex_command: "sleep 10".into(),
             codex_stall_timeout_ms: 10_000,
-            agent_claim_state: Some("In Progress".into()),
+            tracker_claim_state: Some("In Progress".into()),
             ..ServiceConfig::default()
         };
         config.agent_max_retry_backoff_ms = 1_000;
@@ -1641,7 +1671,7 @@ mod tests {
             workspace_root: tmp.path().to_string_lossy().into_owned(),
             mock_mode: true,
             mock_agent: true,
-            agent_claim_state: Some("In Progress".into()),
+            tracker_claim_state: Some("In Progress".into()),
             ..ServiceConfig::default()
         };
         let workspace_mgr = WorkspaceManager::new(tmp.path().to_path_buf());
@@ -1669,7 +1699,7 @@ mod tests {
             workspace_root: tmp.path().to_string_lossy().into_owned(),
             mock_mode: true,
             mock_agent: true,
-            agent_completion_state: Some("In Review".into()),
+            tracker_completion_state: Some("In Review".into()),
             ..ServiceConfig::default()
         };
         let tracker = RecordingTracker::new();

@@ -84,7 +84,7 @@ Key config sections:
 
 | Section | Purpose |
 |---------|---------|
-| `tracker` | Linear API credentials, project slug, active/terminal states |
+| `tracker` | Linear API credentials, project slug, active/terminal states, handoff transitions |
 | `polling` | Poll interval in ms |
 | `workspace` | Root directory, path resolution |
 | `hooks` | Shell scripts for workspace lifecycle |
@@ -92,6 +92,41 @@ Key config sections:
 | `codex` | Agent command, timeouts, stall detection |
 
 Environment variable indirection is supported: use `$VAR_NAME` in config values.
+
+### Tracker handoff policy
+
+The `tracker` section owns issue-state handoff policy because these transitions
+are updates to the external tracker, not agent runtime settings:
+
+```yaml
+tracker:
+  active_states:
+    - Todo
+    - In Progress
+  terminal_states:
+    - Closed
+    - Cancelled
+    - Done
+  claim_state: In Progress
+  completion_state: In Review
+```
+
+`claim_state` is optional. When set, Symphony moves an issue to that state before
+starting the worker; the value must also appear in `tracker.active_states` so
+claimed work remains active during reconciliation.
+
+`completion_state` is optional. When set, Symphony treats a normal worker exit as
+a tracker handoff, stops after one agent turn, runs `after_run`, and then moves
+the issue to the configured state. Failed, cancelled, or stalled runs do not get
+the completion transition. The value must not appear in `tracker.active_states`,
+otherwise a completed issue would re-enter Symphony's dispatch pool. This matches
+the spec handoff model: the agent still does the repository/PR work described by
+the prompt, while Symphony performs the tracker state transition that hands the
+issue to the next human or automation stage, for example `In Review`.
+
+Older workflows may still use `agent.claim_state` and `agent.completion_state`;
+those keys are accepted as aliases, but `tracker.*` is the preferred schema.
+If both locations are present, their values must match.
 
 ### Agent safety budgets
 
@@ -157,11 +192,12 @@ cargo test -- --nocapture
 cargo test config
 ```
 
-Currently 22 unit tests covering:
+Currently 41 unit tests covering:
 - Workflow YAML parsing and validation
 - Template rendering (Liquid strict mode, unknown variable rejection)
 - Workspace creation, sanitization, removal
 - Config defaults, env var expansion, path resolution
+- Tracker handoff policy parsing and validation
 - Issue state normalization
 - Tracker response parsing
 - Orchestrator backoff computation

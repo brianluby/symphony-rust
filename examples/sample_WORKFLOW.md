@@ -10,6 +10,8 @@ tracker:
     - Closed
     - Cancelled
     - Done
+  claim_state: In Progress
+  completion_state: In Review
 
 polling:
   interval_ms: 30000
